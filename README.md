@@ -35,20 +35,20 @@ Razer Battery Display keeps it simple: start with Windows, sit in the tray, show
 
 The app caches the working HID device path after startup, then only wakes up for the Windows tray message loop and a battery poll every 5 minutes. The tray icon is only redrawn when the visible percentage changes.
 
-## Current Footprint
+## Example Footprint
 
-Measured on Windows 11 with the optimized build installed:
+Measured on Windows 11 with the optimized build installed. Windows can trim or grow the shared working set over time, so private memory is the best quick read on what the app itself owns.
 
 | Metric | Result |
 | --- | ---: |
-| Installed exe size | 253.5 KB |
-| Private memory | 1.79 MB |
-| Working set | 11.38 MB |
+| Installed exe size | about 257 KB |
+| Private memory | about 1.8 MB |
+| Working set | about 7-11 MB |
 | Idle CPU over 75 seconds | 0% |
 | Settled threads | 1 |
-| Handles | 177 |
+| Handles | about 150-180 |
 
-Most of the working set is normal shared Windows DLL/runtime memory. The private memory is the better read on what the app itself owns.
+Most of the working set is normal shared Windows DLL/runtime memory.
 
 ## Supported Mouse
 
@@ -107,6 +107,12 @@ Hardware probe:
 
 ```powershell
 cargo run -- --probe
+```
+
+Verbose probe with full HID instance paths:
+
+```powershell
+cargo run -- --probe-verbose
 ```
 
 ## Privacy

@@ -3,10 +3,11 @@ name: Windows build
 on:
   push:
     branches: [main]
+    tags: ["v*"]
   pull_request:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   build:
@@ -44,3 +45,10 @@ jobs:
         with:
           name: RazerBatteryDisplaySetup
           path: dist/RazerBatteryDisplaySetup.exe
+
+      - name: Attach setup exe to release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/RazerBatteryDisplaySetup.exe
+          generate_release_notes: true
