@@ -115,6 +115,14 @@ pub fn read_viper_v4() -> Result<BatteryReading, BatteryError> {
 }
 
 pub fn probe_report() -> String {
+    probe_report_inner(false)
+}
+
+pub fn probe_report_verbose() -> String {
+    probe_report_inner(true)
+}
+
+fn probe_report_inner(verbose: bool) -> String {
     let mut lines = vec!["Razer Battery Display probe".to_string()];
 
     match hid_candidates() {
@@ -123,10 +131,19 @@ pub fn probe_report() -> String {
         }
         Ok(candidates) => {
             for candidate in &candidates {
-                lines.push(format!(
-                    "found PID {:04X}, product {}, path {}",
-                    candidate.pid, candidate.product, candidate.path
-                ));
+                if verbose {
+                    lines.push(format!(
+                        "found PID {:04X}, product {}, path {}",
+                        candidate.pid, candidate.product, candidate.path
+                    ));
+                } else {
+                    lines.push(format!(
+                        "found PID {:04X}, product {}, interface {}",
+                        candidate.pid,
+                        candidate.product,
+                        path_interface_hint(&candidate.path)
+                    ));
+                }
             }
         }
         Err(err) => lines.push(format!("HID enumeration failed: {err}")),
@@ -410,6 +427,17 @@ fn is_viper_pid(pid: u16) -> bool {
     matches!(pid, VIPER_V4_PRO_WIRED_PID | VIPER_V4_PRO_WIRELESS_PID)
 }
 
+fn path_interface_hint(path: &str) -> String {
+    let lower = path.to_ascii_lowercase();
+    for prefix in ["mi_00", "mi_01", "mi_02", "mi_03", "mi_04"] {
+        if lower.contains(prefix) {
+            return prefix.to_string();
+        }
+    }
+
+    "unknown".to_string()
+}
+
 fn raw_to_percent(raw: u8) -> u8 {
     (((raw as u16) * 100 + 127) / 255).min(100) as u8
 }
@@ -457,5 +485,63 @@ impl Drop for DeviceHandle {
         unsafe {
             CloseHandle(self.0);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn report_has_expected_razer_battery_request_layout() {
+        let report = build_report();
+
+        assert_eq!(report.len(), HID_REPORT_LEN);
+        assert_eq!(report[0], 0);
+        assert_eq!(report[1], 0);
+        assert_eq!(report[2], TRANSACTION_ID);
+        assert_eq!(report[6], BATTERY_DATA_SIZE);
+        assert_eq!(report[7], CMD_CLASS_MISC);
+        assert_eq!(report[8], CMD_GET_BATTERY);
+        assert_eq!(report[89], calculate_crc(&report));
+        assert_eq!(report[90], 0);
+    }
+
+    #[test]
+    fn validates_battery_response() {
+        let mut response = [0_u8; HID_REPORT_LEN];
+        response[1] = STATUS_SUCCESS;
+        response[2] = TRANSACTION_ID;
+        response[6] = BATTERY_DATA_SIZE;
+        response[7] = CMD_CLASS_MISC;
+        response[8] = CMD_GET_BATTERY;
+        response[10] = 128;
+
+        assert_eq!(validate_response(&response).unwrap(), 128);
+    }
+
+    #[test]
+    fn rejects_unexpected_response_headers() {
+        let mut response = [0_u8; HID_REPORT_LEN];
+        response[1] = 0x03;
+        response[2] = TRANSACTION_ID;
+        response[6] = BATTERY_DATA_SIZE;
+        response[7] = CMD_CLASS_MISC;
+        response[8] = CMD_GET_BATTERY;
+
+        assert!(validate_response(&response).is_err());
+    }
+
+    #[test]
+    fn raw_battery_values_map_to_percentages() {
+        assert_eq!(raw_to_percent(0), 0);
+        assert_eq!(raw_to_percent(128), 50);
+        assert_eq!(raw_to_percent(255), 100);
+    }
+
+    #[test]
+    fn probe_interface_hint_avoids_instance_id() {
+        let hint = path_interface_hint(r"\\?\hid#vid_1532&pid_00e6&mi_03#b&1d7ae382&0&0000#...");
+        assert_eq!(hint, "mi_03");
     }
 }

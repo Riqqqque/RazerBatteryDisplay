@@ -31,6 +31,10 @@ fn run() -> Result<(), Box<dyn Error>> {
             println!("{}", battery::probe_report());
             return Ok(());
         }
+        Some("--probe-verbose") => {
+            println!("{}", battery::probe_report_verbose());
+            return Ok(());
+        }
         Some("--install") => {
             install::install()?;
             return Ok(());

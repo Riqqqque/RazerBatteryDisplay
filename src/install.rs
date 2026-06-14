@@ -2,14 +2,13 @@ use std::{
     env,
     error::Error,
     fs,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     process::Command,
-    thread,
     time::{Duration, Instant},
 };
 
 use windows_sys::Win32::{
-    Foundation::{CloseHandle, ERROR_SUCCESS},
+    Foundation::{CloseHandle, ERROR_SUCCESS, WAIT_OBJECT_0},
     Storage::FileSystem::SYNCHRONIZE,
     System::{
         Registry::{
@@ -19,7 +18,7 @@ use windows_sys::Win32::{
         },
         Threading::{GetCurrentProcessId, OpenProcess, WaitForSingleObject},
     },
-    UI::WindowsAndMessaging::{FindWindowW, PostMessageW, WM_CLOSE},
+    UI::WindowsAndMessaging::{FindWindowW, GetWindowThreadProcessId, PostMessageW, WM_CLOSE},
 };
 
 use crate::{APP_ID, APP_NAME, APP_VERSION, EXE_NAME, WINDOW_CLASS, win};
@@ -37,8 +36,11 @@ pub fn install_quiet() -> Result<(), Box<dyn Error>> {
 }
 
 fn install_inner(show_message: bool) -> Result<(), Box<dyn Error>> {
-    request_running_app_exit();
-    thread::sleep(Duration::from_millis(300));
+    if let Some(pid) = request_running_app_exit()
+        && !wait_for_process_to_exit(pid, Duration::from_secs(8))
+    {
+        return Err("the running tray process did not exit before reinstall".into());
+    }
 
     let source = env::current_exe()?;
     let target = installed_exe();
@@ -96,7 +98,7 @@ pub fn finish_uninstall(args: &[String]) -> Result<(), Box<dyn Error>> {
     }
 
     let pid: u32 = args[0].parse()?;
-    let dir = PathBuf::from(&args[1]);
+    let dir = validate_uninstall_dir(Path::new(&args[1]))?;
     wait_for_process_to_exit(pid, Duration::from_secs(8));
 
     let deadline = Instant::now() + Duration::from_secs(8);
@@ -113,7 +115,7 @@ pub fn finish_uninstall(args: &[String]) -> Result<(), Box<dyn Error>> {
             }
             Err(err) => {
                 last_error = Some(err);
-                thread::sleep(Duration::from_millis(350));
+                std::thread::sleep(Duration::from_millis(350));
             }
         }
     }
@@ -262,27 +264,35 @@ fn start_menu_programs_dir() -> Option<PathBuf> {
     })
 }
 
-fn request_running_app_exit() {
+fn request_running_app_exit() -> Option<u32> {
     let class = win::wide_null(WINDOW_CLASS);
     let hwnd = unsafe { FindWindowW(class.as_ptr(), std::ptr::null()) };
-    if !hwnd.is_null() {
-        unsafe {
-            PostMessageW(hwnd, WM_CLOSE, 0, 0);
-        }
+    if hwnd.is_null() {
+        return None;
     }
+
+    let mut pid = 0_u32;
+    unsafe {
+        GetWindowThreadProcessId(hwnd, &mut pid);
+        PostMessageW(hwnd, WM_CLOSE, 0, 0);
+    }
+
+    (pid != 0).then_some(pid)
 }
 
-fn wait_for_process_to_exit(pid: u32, duration: Duration) {
+fn wait_for_process_to_exit(pid: u32, duration: Duration) -> bool {
     let handle = unsafe { OpenProcess(SYNCHRONIZE, 0, pid) };
     if handle.is_null() {
-        thread::sleep(duration.min(Duration::from_secs(2)));
-        return;
+        return true;
     }
 
+    let result =
+        unsafe { WaitForSingleObject(handle, duration.as_millis().min(u32::MAX as u128) as u32) };
     unsafe {
-        WaitForSingleObject(handle, duration.as_millis().min(u32::MAX as u128) as u32);
         CloseHandle(handle);
     }
+
+    result == WAIT_OBJECT_0
 }
 
 fn env_path(name: &str) -> Option<PathBuf> {
@@ -445,5 +455,69 @@ fn delete_reg_tree(root: HKEY, subkey: &str) {
     let subkey = win::wide_null(subkey);
     unsafe {
         RegDeleteTreeW(root, subkey.as_ptr());
+    }
+}
+
+fn validate_uninstall_dir(path: &Path) -> Result<PathBuf, Box<dyn Error>> {
+    let actual = normalized_absolute_path(path)?;
+    let expected = normalized_absolute_path(&install_dir())?;
+
+    if same_path(&actual, &expected) {
+        Ok(expected)
+    } else {
+        Err(format!(
+            "refusing to remove {}, expected {}",
+            actual.display(),
+            expected.display()
+        )
+        .into())
+    }
+}
+
+fn normalized_absolute_path(path: &Path) -> Result<PathBuf, Box<dyn Error>> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        env::current_dir()?.join(path)
+    };
+
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            _ => normalized.push(component.as_os_str()),
+        }
+    }
+
+    Ok(normalized)
+}
+
+fn same_path(left: &Path, right: &Path) -> bool {
+    let normalize = |path: &Path| {
+        path.to_string_lossy()
+            .replace('/', "\\")
+            .trim_end_matches('\\')
+            .to_ascii_lowercase()
+    };
+
+    normalize(left) == normalize(right)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn uninstall_dir_validation_accepts_install_dir() {
+        assert!(validate_uninstall_dir(&install_dir()).is_ok());
+    }
+
+    #[test]
+    fn uninstall_dir_validation_rejects_other_paths() {
+        let other = env::temp_dir().join("RazerBatteryDisplay-should-not-delete");
+        assert!(validate_uninstall_dir(&other).is_err());
     }
 }
