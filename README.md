@@ -33,7 +33,7 @@ Razer Battery Display keeps it simple: start with Windows, sit in the tray, show
 - No RGB/profile system.
 - No always-busy polling loop.
 
-The app caches the working HID device path after startup, then only wakes up for the Windows tray message loop and a battery poll every 5 minutes. The tray icon is only redrawn when the visible percentage changes.
+The app only queries the Viper V4 Pro non-pointer HID feature interfaces (`mi_03`/`mi_04`) for battery reports, then caches the working path. It does not hook mouse input, read pointer movement, or send feature reports to the mouse/keyboard input collections. After startup it only wakes up for the Windows tray message loop and a battery poll every 5 minutes. The tray icon is only redrawn when the visible percentage changes.
 
 ## Example Footprint
 
