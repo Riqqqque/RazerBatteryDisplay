@@ -1,7 +1,10 @@
 use std::{error::Error, mem, ptr};
 
 use windows_sys::Win32::{
-    Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM},
+    Foundation::{
+        CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE, HWND, LPARAM, LRESULT, POINT,
+        RECT, WPARAM,
+    },
     Graphics::Gdi::{
         CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, CreateBitmap, CreateCompatibleBitmap,
         CreateCompatibleDC, CreateFontW, CreateSolidBrush, DEFAULT_CHARSET, DEFAULT_PITCH,
@@ -9,7 +12,7 @@ use windows_sys::Win32::{
         FW_BOLD, FillRect, HBRUSH, HGDIOBJ, OUT_DEFAULT_PRECIS, ReleaseDC, SelectObject, SetBkMode,
         SetTextColor, TRANSPARENT,
     },
-    System::LibraryLoader::GetModuleHandleW,
+    System::{LibraryLoader::GetModuleHandleW, Threading::CreateMutexW},
     UI::{
         Shell::{
             NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW,
@@ -20,11 +23,11 @@ use windows_sys::Win32::{
             CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyMenu,
             DestroyWindow, DispatchMessageW, FindWindowW, GWLP_USERDATA, GetCursorPos, GetMessageW,
             GetWindowLongPtrW, HICON, HMENU, ICONINFO, IDC_ARROW, IDI_APPLICATION, IMAGE_ICON,
-            LR_DEFAULTSIZE, LoadCursorW, LoadImageW, MF_CHECKED, MF_SEPARATOR, MF_STRING, MSG,
-            PostQuitMessage, RegisterClassW, SetForegroundWindow, SetTimer, SetWindowLongPtrW,
-            TPM_BOTTOMALIGN, TPM_LEFTALIGN, TrackPopupMenu, TranslateMessage, WM_APP, WM_CLOSE,
-            WM_COMMAND, WM_CREATE, WM_DESTROY, WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_RBUTTONUP,
-            WM_TIMER, WNDCLASSW, WS_OVERLAPPED,
+            KillTimer, LR_DEFAULTSIZE, LoadCursorW, LoadImageW, MF_CHECKED, MF_SEPARATOR,
+            MF_STRING, MSG, PostQuitMessage, RegisterClassW, SetForegroundWindow, SetTimer,
+            SetWindowLongPtrW, TPM_BOTTOMALIGN, TPM_LEFTALIGN, TrackPopupMenu, TranslateMessage,
+            WM_APP, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_DESTROY, WM_LBUTTONDBLCLK, WM_LBUTTONUP,
+            WM_RBUTTONUP, WM_TIMER, WNDCLASSW, WS_OVERLAPPED,
         },
     },
 };
@@ -35,6 +38,7 @@ const TRAY_UID: u32 = 1;
 const TRAY_CALLBACK: u32 = WM_APP + 1;
 const TIMER_ID: usize = 1;
 const POLL_MS: u32 = 300_000;
+const INSTANCE_MUTEX: &str = "Local\\RazerBatteryDisplayTray";
 
 const MENU_REFRESH: usize = 1001;
 const MENU_STARTUP: usize = 1002;
@@ -42,6 +46,10 @@ const MENU_UNINSTALL: usize = 1003;
 const MENU_QUIT: usize = 1004;
 
 pub fn run() -> Result<(), Box<dyn Error>> {
+    let Some(_instance_guard) = SingleInstance::acquire()? else {
+        return Ok(());
+    };
+
     if another_instance_running() {
         return Ok(());
     }
@@ -89,8 +97,12 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     state.refresh();
     state.add_or_update_icon(true)?;
 
-    unsafe {
-        SetTimer(hwnd, TIMER_ID, POLL_MS, None);
+    if unsafe { SetTimer(hwnd, TIMER_ID, POLL_MS, None) } == 0 {
+        state.remove_icon();
+        unsafe {
+            DestroyWindow(hwnd);
+        }
+        return Err("could not start the battery refresh timer".into());
     }
 
     let mut msg: MSG = unsafe { mem::zeroed() };
@@ -103,6 +115,39 @@ pub fn run() -> Result<(), Box<dyn Error>> {
 
     state.remove_icon();
     Ok(())
+}
+
+struct SingleInstance(HANDLE);
+
+impl SingleInstance {
+    fn acquire() -> Result<Option<Self>, Box<dyn Error>> {
+        let name = win::wide_null(INSTANCE_MUTEX);
+        let handle = unsafe { CreateMutexW(ptr::null(), 1, name.as_ptr()) };
+        if handle.is_null() {
+            return Err(format!(
+                "could not create single-instance mutex: {}",
+                std::io::Error::last_os_error()
+            )
+            .into());
+        }
+
+        if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+            unsafe {
+                CloseHandle(handle);
+            }
+            return Ok(None);
+        }
+
+        Ok(Some(Self(handle)))
+    }
+}
+
+impl Drop for SingleInstance {
+    fn drop(&mut self) {
+        unsafe {
+            CloseHandle(self.0);
+        }
+    }
 }
 
 struct AppState {
@@ -344,6 +389,9 @@ unsafe extern "system" fn window_proc(
         WM_DESTROY => {
             if let Some(state) = state {
                 state.remove_icon();
+            }
+            unsafe {
+                KillTimer(hwnd, TIMER_ID);
             }
             unsafe {
                 PostQuitMessage(0);
