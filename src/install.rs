@@ -8,7 +8,7 @@ use std::{
 };
 
 use windows_sys::Win32::{
-    Foundation::{CloseHandle, ERROR_SUCCESS, WAIT_OBJECT_0},
+    Foundation::{CloseHandle, ERROR_FILE_NOT_FOUND, ERROR_SUCCESS, WAIT_OBJECT_0},
     Storage::FileSystem::SYNCHRONIZE,
     System::{
         Registry::{
@@ -24,6 +24,8 @@ use windows_sys::Win32::{
 use crate::{APP_ID, APP_NAME, APP_VERSION, EXE_NAME, WINDOW_CLASS, win};
 
 const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
+const STARTUP_APPROVED_RUN_KEY: &str =
+    r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run";
 const UNINSTALL_KEY: &str =
     r"Software\Microsoft\Windows\CurrentVersion\Uninstall\RazerBatteryDisplay";
 
@@ -35,7 +37,16 @@ pub fn install_quiet() -> Result<(), Box<dyn Error>> {
     install_inner(false)
 }
 
+pub fn repair_startup() -> Result<(), Box<dyn Error>> {
+    if !installed_exe().is_file() {
+        return Err("the installed app is missing; run the setup exe to reinstall it".into());
+    }
+    set_startup_enabled(true)
+}
+
 fn install_inner(show_message: bool) -> Result<(), Box<dyn Error>> {
+    let _ = fs::remove_file(uninstall_helper());
+
     if let Some(pid) = request_running_app_exit()
         && !wait_for_process_to_exit(pid, Duration::from_secs(8))
     {
@@ -50,7 +61,12 @@ fn install_inner(show_message: bool) -> Result<(), Box<dyn Error>> {
         .to_path_buf();
 
     fs::create_dir_all(&target_dir)?;
-    fs::copy(&source, &target)?;
+    if !same_path(
+        &normalized_absolute_path(&source)?,
+        &normalized_absolute_path(&target)?,
+    ) {
+        fs::copy(&source, &target)?;
+    }
 
     set_startup_enabled(true)?;
     write_uninstall_entry(&target, &target_dir)?;
@@ -68,37 +84,55 @@ fn install_inner(show_message: bool) -> Result<(), Box<dyn Error>> {
 }
 
 pub fn uninstall() -> Result<(), Box<dyn Error>> {
+    uninstall_inner(true)
+}
+
+pub fn uninstall_quiet() -> Result<(), Box<dyn Error>> {
+    uninstall_inner(false)
+}
+
+fn uninstall_inner(show_message: bool) -> Result<(), Box<dyn Error>> {
     request_running_app_exit();
-    set_startup_enabled(false)?;
-    delete_reg_tree(HKEY_CURRENT_USER, UNINSTALL_KEY);
+    remove_startup_registration()?;
+    delete_reg_tree(HKEY_CURRENT_USER, UNINSTALL_KEY)?;
     remove_start_menu_shortcut();
 
     let dir = install_dir();
     let current = env::current_exe()?;
 
-    if current.starts_with(&dir) {
-        let helper = env::temp_dir().join("RazerBatteryDisplayUninstall.exe");
+    if current
+        .parent()
+        .is_some_and(|parent| same_path(parent, &dir))
+    {
+        let helper = uninstall_helper();
         fs::copy(&current, &helper)?;
-        Command::new(&helper)
+        let mut command = Command::new(&helper);
+        command
             .arg("--finish-uninstall")
             .arg(unsafe { GetCurrentProcessId() }.to_string())
-            .arg(dir)
-            .spawn()?;
+            .arg(dir);
+        if !show_message {
+            command.arg("--quiet");
+        }
+        command.spawn()?;
     } else if dir.exists() {
         fs::remove_dir_all(dir)?;
-        win::message_box(APP_NAME, "Uninstalled.");
+        if show_message {
+            win::message_box(APP_NAME, "Uninstalled.");
+        }
     }
 
     Ok(())
 }
 
 pub fn finish_uninstall(args: &[String]) -> Result<(), Box<dyn Error>> {
-    if args.len() < 2 {
-        return Err("missing uninstall helper arguments".into());
+    if !(args.len() == 2 || (args.len() == 3 && args[2] == "--quiet")) {
+        return Err("invalid uninstall helper arguments".into());
     }
 
     let pid: u32 = args[0].parse()?;
     let dir = validate_uninstall_dir(Path::new(&args[1]))?;
+    let show_message = args.get(2).is_none_or(|arg| arg != "--quiet");
     wait_for_process_to_exit(pid, Duration::from_secs(8));
 
     let deadline = Instant::now() + Duration::from_secs(8);
@@ -106,11 +140,15 @@ pub fn finish_uninstall(args: &[String]) -> Result<(), Box<dyn Error>> {
     while Instant::now() < deadline {
         match fs::remove_dir_all(&dir) {
             Ok(()) => {
-                win::message_box(APP_NAME, "Uninstalled.");
+                if show_message {
+                    win::message_box(APP_NAME, "Uninstalled.");
+                }
                 return Ok(());
             }
             Err(_) if !dir.exists() => {
-                win::message_box(APP_NAME, "Uninstalled.");
+                if show_message {
+                    win::message_box(APP_NAME, "Uninstalled.");
+                }
                 return Ok(());
             }
             Err(err) => {
@@ -135,7 +173,7 @@ pub fn installed_exe() -> PathBuf {
 }
 
 pub fn startup_enabled() -> bool {
-    let expected = quote_arg(&installed_exe()) + " --run";
+    let expected = startup_command();
     read_reg_string(HKEY_CURRENT_USER, RUN_KEY, APP_ID)
         .map(|value| value == expected)
         .unwrap_or(false)
@@ -143,10 +181,20 @@ pub fn startup_enabled() -> bool {
 
 pub fn set_startup_enabled(enabled: bool) -> Result<(), Box<dyn Error>> {
     if enabled {
-        let value = quote_arg(&installed_exe()) + " --run";
+        delete_reg_value(HKEY_CURRENT_USER, STARTUP_APPROVED_RUN_KEY, APP_ID)?;
+        let value = startup_command();
         set_reg_string(HKEY_CURRENT_USER, RUN_KEY, APP_ID, &value)?;
     } else {
-        delete_reg_value(HKEY_CURRENT_USER, RUN_KEY, APP_ID);
+        delete_reg_value(HKEY_CURRENT_USER, RUN_KEY, APP_ID)?;
+    }
+
+    if startup_enabled() != enabled {
+        return Err(if enabled {
+            "Windows did not save the startup command"
+        } else {
+            "Windows did not remove the startup command"
+        }
+        .into());
     }
 
     Ok(())
@@ -178,7 +226,7 @@ fn write_uninstall_entry(exe: &Path, dir: &Path) -> Result<(), Box<dyn Error>> {
         HKEY_CURRENT_USER,
         UNINSTALL_KEY,
         "DisplayIcon",
-        &format!("{},0", exe.display()),
+        &format!("{},0", quote_arg(exe)),
     )?;
     set_reg_string(
         HKEY_CURRENT_USER,
@@ -190,7 +238,7 @@ fn write_uninstall_entry(exe: &Path, dir: &Path) -> Result<(), Box<dyn Error>> {
         HKEY_CURRENT_USER,
         UNINSTALL_KEY,
         "QuietUninstallString",
-        &(quote_arg(exe) + " --uninstall"),
+        &(quote_arg(exe) + " --uninstall-quiet"),
     )?;
     set_reg_dword(HKEY_CURRENT_USER, UNINSTALL_KEY, "NoModify", 1)?;
     set_reg_dword(HKEY_CURRENT_USER, UNINSTALL_KEY, "NoRepair", 1)?;
@@ -231,10 +279,21 @@ fn create_lnk_with_powershell(exe: &Path, lnk: &Path) -> Result<(), Box<dyn Erro
         ps_quote(&exe.display().to_string()),
     );
 
-    let status = Command::new("powershell")
+    let powershell = env_path("SystemRoot")
+        .unwrap_or_else(|| PathBuf::from(r"C:\Windows"))
+        .join("System32")
+        .join("WindowsPowerShell")
+        .join("v1.0")
+        .join("powershell.exe");
+    if !powershell.is_file() {
+        return Err(format!("PowerShell was not found at {}", powershell.display()).into());
+    }
+
+    let status = Command::new(powershell)
         .arg("-NoProfile")
-        .arg("-ExecutionPolicy")
-        .arg("Bypass")
+        .arg("-NonInteractive")
+        .arg("-WindowStyle")
+        .arg("Hidden")
         .arg("-Command")
         .arg(script)
         .status()?;
@@ -299,8 +358,16 @@ fn env_path(name: &str) -> Option<PathBuf> {
     env::var_os(name).map(PathBuf::from)
 }
 
+fn uninstall_helper() -> PathBuf {
+    env::temp_dir().join("RazerBatteryDisplayUninstall.exe")
+}
+
 fn quote_arg(path: &Path) -> String {
     format!("\"{}\"", path.display())
+}
+
+fn startup_command() -> String {
+    quote_arg(&installed_exe()) + " --run"
 }
 
 fn ps_quote(value: &str) -> String {
@@ -432,8 +499,19 @@ fn read_reg_string(root: HKEY, subkey: &str, name: &str) -> Option<String> {
         return None;
     }
 
-    let words =
-        unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const u16, byte_len as usize / 2) };
+    bytes.truncate(byte_len as usize);
+    decode_reg_string(&bytes)
+}
+
+fn decode_reg_string(bytes: &[u8]) -> Option<String> {
+    if bytes.len() < size_of::<u16>() || !bytes.len().is_multiple_of(size_of::<u16>()) {
+        return None;
+    }
+
+    let words: Vec<u16> = bytes
+        .chunks_exact(size_of::<u16>())
+        .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+        .collect();
     let end = words
         .iter()
         .position(|value| *value == 0)
@@ -441,21 +519,43 @@ fn read_reg_string(root: HKEY, subkey: &str, name: &str) -> Option<String> {
     String::from_utf16(&words[..end]).ok()
 }
 
-fn delete_reg_value(root: HKEY, subkey: &str, name: &str) {
-    if let Ok(key) = open_reg_key(root, subkey) {
-        let name = win::wide_null(name);
-        unsafe {
-            RegDeleteValueW(key, name.as_ptr());
-            RegCloseKey(key);
-        }
+fn delete_reg_value(root: HKEY, subkey: &str, name: &str) -> Result<(), Box<dyn Error>> {
+    let subkey = win::wide_null(subkey);
+    let mut key: HKEY = std::ptr::null_mut();
+    let opened = unsafe { RegOpenKeyExW(root, subkey.as_ptr(), 0, KEY_SET_VALUE, &mut key) };
+    if opened == ERROR_FILE_NOT_FOUND {
+        return Ok(());
+    }
+    if opened != ERROR_SUCCESS {
+        return Err(format!("registry open failed: {opened}").into());
+    }
+
+    let name = win::wide_null(name);
+    let result = unsafe { RegDeleteValueW(key, name.as_ptr()) };
+    unsafe {
+        RegCloseKey(key);
+    }
+
+    if result == ERROR_SUCCESS || result == ERROR_FILE_NOT_FOUND {
+        Ok(())
+    } else {
+        Err(format!("registry value removal failed: {result}").into())
     }
 }
 
-fn delete_reg_tree(root: HKEY, subkey: &str) {
+fn delete_reg_tree(root: HKEY, subkey: &str) -> Result<(), Box<dyn Error>> {
     let subkey = win::wide_null(subkey);
-    unsafe {
-        RegDeleteTreeW(root, subkey.as_ptr());
+    let result = unsafe { RegDeleteTreeW(root, subkey.as_ptr()) };
+    if result == ERROR_SUCCESS || result == ERROR_FILE_NOT_FOUND {
+        Ok(())
+    } else {
+        Err(format!("registry tree removal failed: {result}").into())
     }
+}
+
+fn remove_startup_registration() -> Result<(), Box<dyn Error>> {
+    delete_reg_value(HKEY_CURRENT_USER, RUN_KEY, APP_ID)?;
+    delete_reg_value(HKEY_CURRENT_USER, STARTUP_APPROVED_RUN_KEY, APP_ID)
 }
 
 fn validate_uninstall_dir(path: &Path) -> Result<PathBuf, Box<dyn Error>> {
@@ -519,5 +619,24 @@ mod tests {
     fn uninstall_dir_validation_rejects_other_paths() {
         let other = env::temp_dir().join("RazerBatteryDisplay-should-not-delete");
         assert!(validate_uninstall_dir(&other).is_err());
+    }
+
+    #[test]
+    fn registry_strings_decode_without_pointer_casts() {
+        let bytes = [b'T', 0, b'e', 0, b's', 0, b't', 0, 0, 0];
+        assert_eq!(decode_reg_string(&bytes).as_deref(), Some("Test"));
+    }
+
+    #[test]
+    fn registry_string_decoder_rejects_odd_byte_counts() {
+        assert!(decode_reg_string(&[b'T', 0, b'e']).is_none());
+    }
+
+    #[test]
+    fn path_comparison_is_case_insensitive_and_separator_agnostic() {
+        assert!(same_path(
+            Path::new(r"C:\Users\Rique\App"),
+            Path::new(r"c:/users/rique/app/")
+        ));
     }
 }

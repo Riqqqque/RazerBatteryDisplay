@@ -33,7 +33,7 @@ Razer Battery Display keeps it simple: start with Windows, sit in the tray, show
 - No RGB/profile system.
 - No always-busy polling loop.
 
-The app only queries the Viper V4 Pro non-pointer HID feature interfaces (`mi_03`/`mi_04`) for battery reports, then caches the working path. It does not hook mouse input, read pointer movement, or send feature reports to the mouse/keyboard input collections. After startup it only wakes up for the Windows tray message loop and a battery poll every 5 minutes. The tray icon is only redrawn when the visible percentage changes.
+The app only queries the Viper V4 Pro non-pointer HID feature interfaces (`mi_03`/`mi_04`) for battery reports, then caches the working path. It does not hook mouse input, read pointer movement, or send feature reports to the mouse/keyboard input collections. After startup it only wakes up for the Windows tray message loop and a battery poll every 5 minutes. During normal operation, the tray icon is only redrawn when the visible percentage changes; it is also restored if Explorer recreates the taskbar.
 
 ## Example Footprint
 
@@ -42,11 +42,11 @@ Measured on Windows 11 with the optimized build installed. Windows can trim or g
 | Metric | Result |
 | --- | ---: |
 | Installed exe size | about 257 KB |
-| Private memory | about 1.8 MB |
-| Working set | about 7-11 MB |
+| Private memory | about 1.9 MB |
+| Working set | about 12 MB |
 | Idle CPU over 75 seconds | 0% |
 | Settled threads | 1 |
-| Handles | about 150-180 |
+| Handles | about 150 |
 
 Most of the working set is normal shared Windows DLL/runtime memory.
 
@@ -98,9 +98,9 @@ Left-click refreshes the battery percentage.
 
 ```powershell
 cargo fmt --check
-cargo clippy -- -D warnings
-cargo test
-cargo build --release
+cargo clippy --all-targets --all-features --locked -- -D warnings
+cargo test --all-targets --all-features --locked
+cargo build --release --locked
 ```
 
 Hardware probe:
@@ -117,7 +117,7 @@ cargo run -- --probe-verbose
 
 ## Privacy
 
-The app only talks to the local HID device and Windows registry entries needed for install/startup/uninstall. It does not send network requests, collect telemetry, or store personal data.
+The app only talks to the local HID device and the current-user Windows registry entries needed for install/startup/uninstall. Startup uses the normal per-user `Run` entry; it does not install a service or scheduled task. It does not send network requests, collect telemetry, or store personal data.
 
 ## License
 

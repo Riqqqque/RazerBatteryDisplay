@@ -1,8 +1,12 @@
 [package]
 name = "razer-battery-display"
-version = "0.1.2"
+version = "0.1.5"
 edition = "2024"
 authors = ["Rique"]
+license = "MIT"
+description = "Lightweight Windows tray battery display for the Razer Viper V4 Pro"
+repository = "https://github.com/Riqqqque/RazerBatteryDisplay"
+publish = false
 
 [dependencies]
 windows-sys = { version = "0.61", features = [

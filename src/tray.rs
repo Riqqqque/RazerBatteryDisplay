@@ -1,4 +1,8 @@
-use std::{error::Error, mem, ptr};
+use std::{
+    error::Error,
+    mem, ptr,
+    time::{Duration, Instant},
+};
 
 use windows_sys::Win32::{
     Foundation::{
@@ -9,8 +13,8 @@ use windows_sys::Win32::{
         CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, CreateBitmap, CreateCompatibleBitmap,
         CreateCompatibleDC, CreateFontW, CreateSolidBrush, DEFAULT_CHARSET, DEFAULT_PITCH,
         DT_CENTER, DT_SINGLELINE, DT_VCENTER, DeleteDC, DeleteObject, DrawTextW, FF_DONTCARE,
-        FW_BOLD, FillRect, HBRUSH, HGDIOBJ, OUT_DEFAULT_PRECIS, ReleaseDC, SelectObject, SetBkMode,
-        SetTextColor, TRANSPARENT,
+        FW_BOLD, FillRect, GetDC, HBRUSH, HDC, HGDIOBJ, OUT_DEFAULT_PRECIS, ReleaseDC,
+        SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
     },
     System::{LibraryLoader::GetModuleHandleW, Threading::CreateMutexW},
     UI::{
@@ -19,15 +23,15 @@ use windows_sys::Win32::{
             Shell_NotifyIconW,
         },
         WindowsAndMessaging::{
-            AppendMenuW, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, CreateIconIndirect,
-            CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyMenu,
-            DestroyWindow, DispatchMessageW, FindWindowW, GWLP_USERDATA, GetCursorPos, GetMessageW,
-            GetWindowLongPtrW, HICON, HMENU, ICONINFO, IDC_ARROW, IDI_APPLICATION, IMAGE_ICON,
-            KillTimer, LR_DEFAULTSIZE, LoadCursorW, LoadImageW, MF_CHECKED, MF_SEPARATOR,
-            MF_STRING, MSG, PostQuitMessage, RegisterClassW, SetForegroundWindow, SetTimer,
+            AppendMenuW, CREATESTRUCTW, CW_USEDEFAULT, CreateIconIndirect, CreatePopupMenu,
+            CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyMenu, DestroyWindow,
+            DispatchMessageW, GWLP_USERDATA, GetCursorPos, GetMessageW, GetWindowLongPtrW, HICON,
+            HMENU, ICONINFO, IDC_ARROW, IDI_APPLICATION, IMAGE_ICON, KillTimer, LR_DEFAULTSIZE,
+            LoadCursorW, LoadImageW, MF_CHECKED, MF_SEPARATOR, MF_STRING, MSG, PostMessageW,
+            PostQuitMessage, RegisterClassW, RegisterWindowMessageW, SetForegroundWindow, SetTimer,
             SetWindowLongPtrW, TPM_BOTTOMALIGN, TPM_LEFTALIGN, TrackPopupMenu, TranslateMessage,
             WM_APP, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_DESTROY, WM_LBUTTONDBLCLK, WM_LBUTTONUP,
-            WM_RBUTTONUP, WM_TIMER, WNDCLASSW, WS_OVERLAPPED,
+            WM_NULL, WM_RBUTTONUP, WM_TIMER, WNDCLASSW, WS_OVERLAPPED,
         },
     },
 };
@@ -38,7 +42,9 @@ const TRAY_UID: u32 = 1;
 const TRAY_CALLBACK: u32 = WM_APP + 1;
 const TIMER_ID: usize = 1;
 const POLL_MS: u32 = 300_000;
+const MANUAL_REFRESH_COOLDOWN: Duration = Duration::from_secs(2);
 const INSTANCE_MUTEX: &str = "Local\\RazerBatteryDisplayTray";
+const TASKBAR_CREATED: &str = "TaskbarCreated";
 
 const MENU_REFRESH: usize = 1001;
 const MENU_STARTUP: usize = 1002;
@@ -50,15 +56,15 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         return Ok(());
     };
 
-    if another_instance_running() {
-        return Ok(());
-    }
-
     let class_name = win::wide_null(WINDOW_CLASS);
     let instance = unsafe { GetModuleHandleW(ptr::null()) };
+    let taskbar_created = win::wide_null(TASKBAR_CREATED);
+    let taskbar_created_message = unsafe { RegisterWindowMessageW(taskbar_created.as_ptr()) };
+    if taskbar_created_message == 0 {
+        return Err("could not register the taskbar recovery message".into());
+    }
 
     let wc = WNDCLASSW {
-        style: CS_HREDRAW | CS_VREDRAW,
         lpfnWndProc: Some(window_proc),
         hInstance: instance,
         lpszClassName: class_name.as_ptr(),
@@ -71,7 +77,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         return Err("could not register tray window class".into());
     }
 
-    let mut state = Box::new(AppState::new());
+    let mut state = Box::new(AppState::new(taskbar_created_message));
     let hwnd = unsafe {
         CreateWindowExW(
             0,
@@ -106,7 +112,20 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     }
 
     let mut msg: MSG = unsafe { mem::zeroed() };
-    while unsafe { GetMessageW(&mut msg, ptr::null_mut(), 0, 0) } > 0 {
+    loop {
+        let result = unsafe { GetMessageW(&mut msg, ptr::null_mut(), 0, 0) };
+        if result == 0 {
+            break;
+        }
+        if result == -1 {
+            state.remove_icon();
+            return Err(format!(
+                "tray message loop failed: {}",
+                std::io::Error::last_os_error()
+            )
+            .into());
+        }
+
         unsafe {
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
@@ -153,11 +172,14 @@ impl Drop for SingleInstance {
 struct AppState {
     hwnd: HWND,
     icon: HICON,
+    icon_registered: bool,
     reader: battery::BatteryReader,
     reading: Option<battery::BatteryReading>,
     error: Option<String>,
     display_key: DisplayKey,
     startup_enabled: bool,
+    taskbar_created_message: u32,
+    last_refresh: Option<Instant>,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -168,19 +190,23 @@ enum DisplayKey {
 }
 
 impl AppState {
-    fn new() -> Self {
+    fn new(taskbar_created_message: u32) -> Self {
         Self {
             hwnd: ptr::null_mut(),
             icon: ptr::null_mut(),
+            icon_registered: false,
             reader: battery::BatteryReader::new(),
             reading: None,
             error: None,
             display_key: DisplayKey::Unknown,
             startup_enabled: install::startup_enabled(),
+            taskbar_created_message,
+            last_refresh: None,
         }
     }
 
     fn refresh(&mut self) {
+        self.last_refresh = Some(Instant::now());
         match self.reader.read() {
             Ok(reading) => {
                 self.reading = Some(reading);
@@ -193,14 +219,37 @@ impl AppState {
         }
 
         let next_key = self.current_display_key();
-        if next_key != self.display_key {
+        if !self.icon.is_null() && !self.icon_registered {
+            if self.add_or_update_icon(true).is_ok() {
+                self.display_key = next_key;
+            }
+            return;
+        }
+
+        if next_key != self.display_key
+            && (self.icon.is_null() || self.add_or_update_icon(false).is_ok())
+        {
             self.display_key = next_key;
-            let _ = self.add_or_update_icon(false);
         }
     }
 
+    fn refresh_manual(&mut self) {
+        if self
+            .last_refresh
+            .is_some_and(|last| last.elapsed() < MANUAL_REFRESH_COOLDOWN)
+        {
+            return;
+        }
+        self.refresh();
+    }
+
+    fn restore_icon(&mut self) {
+        self.icon_registered = false;
+        let _ = self.add_or_update_icon(true);
+    }
+
     fn add_or_update_icon(&mut self, add: bool) -> Result<(), Box<dyn Error>> {
-        let icon = make_icon(self.reading.as_ref());
+        let icon = make_icon(self.reading.as_ref())?;
         let nid = self.notify_data(icon);
         let op = if add { NIM_ADD } else { NIM_MODIFY };
         let ok = unsafe { Shell_NotifyIconW(op, &nid) };
@@ -217,6 +266,7 @@ impl AppState {
             }
         }
         self.icon = icon;
+        self.icon_registered = true;
         Ok(())
     }
 
@@ -232,6 +282,7 @@ impl AppState {
             }
             self.icon = ptr::null_mut();
         }
+        self.icon_registered = false;
     }
 
     fn notify_data(&self, icon: HICON) -> NOTIFYICONDATAW {
@@ -245,7 +296,14 @@ impl AppState {
 
         let tip = self.tooltip();
         let tip = win::wide_null(&tip);
-        for (slot, value) in nid.szTip.iter_mut().zip(tip.iter()) {
+        for slot in nid.szTip.iter_mut() {
+            *slot = 0;
+        }
+        let copy_len = tip
+            .len()
+            .saturating_sub(1)
+            .min(nid.szTip.len().saturating_sub(1));
+        for (slot, value) in nid.szTip.iter_mut().take(copy_len).zip(tip.iter()) {
             *slot = *value;
         }
 
@@ -265,6 +323,7 @@ impl AppState {
     }
 
     fn show_menu(&mut self) {
+        self.startup_enabled = install::startup_enabled();
         let menu = unsafe { CreatePopupMenu() };
         if menu.is_null() {
             return;
@@ -296,23 +355,37 @@ impl AppState {
                 self.hwnd,
                 ptr::null(),
             );
+            PostMessageW(self.hwnd, WM_NULL, 0, 0);
             DestroyMenu(menu);
         }
     }
 
     fn toggle_startup(&mut self) {
         let next = !self.startup_enabled;
-        if install::set_startup_enabled(next).is_ok() {
-            self.startup_enabled = next;
+        match install::set_startup_enabled(next) {
+            Ok(()) => self.startup_enabled = install::startup_enabled(),
+            Err(err) => win::message_box(
+                APP_NAME,
+                &format!("Could not change the startup setting.\n\n{err}"),
+            ),
         }
     }
 
     fn uninstall(&self) {
-        if let Ok(exe) = std::env::current_exe() {
-            let _ = std::process::Command::new(exe).arg("--uninstall").spawn();
-        }
-        unsafe {
-            DestroyWindow(self.hwnd);
+        let result = std::env::current_exe().and_then(|exe| {
+            std::process::Command::new(exe)
+                .arg("--uninstall")
+                .spawn()
+                .map(|_| ())
+        });
+        match result {
+            Ok(()) => unsafe {
+                DestroyWindow(self.hwnd);
+            },
+            Err(err) => win::message_box_error(
+                APP_NAME,
+                &format!("Could not start the uninstaller.\n\n{err}"),
+            ),
         }
     }
 
@@ -344,6 +417,13 @@ unsafe extern "system" fn window_proc(
     }
 
     let state_ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut AppState };
+    if !state_ptr.is_null() && message == unsafe { (*state_ptr).taskbar_created_message } {
+        unsafe {
+            (*state_ptr).restore_icon();
+        }
+        return 0;
+    }
+
     let state = unsafe { state_ptr.as_mut() };
 
     match message {
@@ -351,7 +431,7 @@ unsafe extern "system" fn window_proc(
             if let Some(state) = state {
                 match lparam as u32 {
                     WM_RBUTTONUP => state.show_menu(),
-                    WM_LBUTTONUP => state.refresh(),
+                    WM_LBUTTONUP => state.refresh_manual(),
                     WM_LBUTTONDBLCLK => win::message_box(APP_NAME, &state.tooltip()),
                     _ => {}
                 }
@@ -361,7 +441,7 @@ unsafe extern "system" fn window_proc(
         WM_COMMAND => {
             if let Some(state) = state {
                 match wparam & 0xffff {
-                    MENU_REFRESH => state.refresh(),
+                    MENU_REFRESH => state.refresh_manual(),
                     MENU_STARTUP => state.toggle_startup(),
                     MENU_UNINSTALL => state.uninstall(),
                     MENU_QUIT => unsafe {
@@ -402,12 +482,6 @@ unsafe extern "system" fn window_proc(
     }
 }
 
-fn another_instance_running() -> bool {
-    let class = win::wide_null(WINDOW_CLASS);
-    let hwnd = unsafe { FindWindowW(class.as_ptr(), ptr::null()) };
-    !hwnd.is_null()
-}
-
 fn append_menu(menu: HMENU, id: usize, label: &str) {
     let label = win::wide_null(label);
     unsafe {
@@ -427,7 +501,7 @@ fn append_menu_checked(menu: HMENU, id: usize, label: &str, checked: bool) {
     }
 }
 
-fn make_icon(reading: Option<&battery::BatteryReading>) -> HICON {
+fn make_icon(reading: Option<&battery::BatteryReading>) -> Result<HICON, Box<dyn Error>> {
     let label = reading
         .map(|reading| reading.percent.to_string())
         .unwrap_or_else(|| "?".to_string());
@@ -437,22 +511,44 @@ fn make_icon(reading: Option<&battery::BatteryReading>) -> HICON {
     let font_name = win::wide_null("Segoe UI");
 
     unsafe {
-        let screen_dc = windows_sys::Win32::Graphics::Gdi::GetDC(ptr::null_mut());
-        let dc = CreateCompatibleDC(screen_dc);
-        let bitmap = CreateCompatibleBitmap(screen_dc, 32, 32);
-        let old_bitmap = SelectObject(dc, bitmap as HGDIOBJ);
+        let screen_dc = ScreenDc(GetDC(ptr::null_mut()));
+        if screen_dc.0.is_null() {
+            return load_fallback_icon();
+        }
 
-        let brush = CreateSolidBrush(bg);
+        let dc = MemoryDc(CreateCompatibleDC(screen_dc.0));
+        if dc.0.is_null() {
+            return load_fallback_icon();
+        }
+
+        let bitmap = GdiObject(CreateCompatibleBitmap(screen_dc.0, 32, 32) as HGDIOBJ);
+        if bitmap.0.is_null() {
+            return load_fallback_icon();
+        }
+        let old_bitmap = SelectObject(dc.0, bitmap.0);
+        if old_bitmap.is_null() {
+            return load_fallback_icon();
+        }
+        let _bitmap_selection = SelectedObject {
+            dc: dc.0,
+            previous: old_bitmap,
+        };
+
+        let brush = GdiObject(CreateSolidBrush(bg) as HGDIOBJ);
+        if brush.0.is_null() {
+            return load_fallback_icon();
+        }
         let rect = RECT {
             left: 0,
             top: 0,
             right: 32,
             bottom: 32,
         };
-        FillRect(dc, &rect, brush as HBRUSH);
-        DeleteObject(brush as HGDIOBJ);
+        if FillRect(dc.0, &rect, brush.0 as HBRUSH) == 0 {
+            return load_fallback_icon();
+        }
 
-        let font = CreateFontW(
+        let font = GdiObject(CreateFontW(
             -16,
             0,
             0,
@@ -467,15 +563,16 @@ fn make_icon(reading: Option<&battery::BatteryReading>) -> HICON {
             CLEARTYPE_QUALITY as u32,
             (DEFAULT_PITCH | FF_DONTCARE) as u32,
             font_name.as_ptr(),
-        );
-        let old_font = if font.is_null() {
-            ptr::null_mut()
+        ) as HGDIOBJ);
+        let _font_selection = if font.0.is_null() {
+            None
         } else {
-            SelectObject(dc, font as HGDIOBJ)
+            let previous = SelectObject(dc.0, font.0);
+            (!previous.is_null()).then_some(SelectedObject { dc: dc.0, previous })
         };
 
-        SetBkMode(dc, TRANSPARENT as i32);
-        SetTextColor(dc, rgb(255, 255, 255));
+        SetBkMode(dc.0, TRANSPARENT as i32);
+        SetTextColor(dc.0, rgb(255, 255, 255));
         let mut text_rect = RECT {
             left: 0,
             top: 0,
@@ -483,47 +580,97 @@ fn make_icon(reading: Option<&battery::BatteryReading>) -> HICON {
             bottom: 31,
         };
         DrawTextW(
-            dc,
+            dc.0,
             label.as_ptr(),
             -1,
             &mut text_rect,
             DT_CENTER | DT_VCENTER | DT_SINGLELINE,
         );
 
-        if !old_font.is_null() {
-            SelectObject(dc, old_font);
+        let mask = GdiObject(CreateBitmap(32, 32, 1, 1, ptr::null()) as HGDIOBJ);
+        if mask.0.is_null() {
+            return load_fallback_icon();
         }
-        if !font.is_null() {
-            DeleteObject(font as HGDIOBJ);
-        }
-        SelectObject(dc, old_bitmap);
-
-        let mask = CreateBitmap(32, 32, 1, 1, ptr::null());
         let info = ICONINFO {
             fIcon: 1,
             xHotspot: 0,
             yHotspot: 0,
-            hbmMask: mask,
-            hbmColor: bitmap,
+            hbmMask: mask.0,
+            hbmColor: bitmap.0,
         };
 
         let icon = CreateIconIndirect(&info);
-        DeleteObject(mask as HGDIOBJ);
-        DeleteObject(bitmap as HGDIOBJ);
-        DeleteDC(dc);
-        ReleaseDC(ptr::null_mut(), screen_dc);
-
         if icon.is_null() {
-            LoadImageW(
-                ptr::null_mut(),
-                IDI_APPLICATION,
-                IMAGE_ICON,
-                32,
-                32,
-                LR_DEFAULTSIZE,
-            ) as HICON
+            load_fallback_icon()
         } else {
-            icon
+            Ok(icon)
+        }
+    }
+}
+
+fn load_fallback_icon() -> Result<HICON, Box<dyn Error>> {
+    let icon = unsafe {
+        LoadImageW(
+            ptr::null_mut(),
+            IDI_APPLICATION,
+            IMAGE_ICON,
+            32,
+            32,
+            LR_DEFAULTSIZE,
+        ) as HICON
+    };
+    if icon.is_null() {
+        Err("could not create or load a tray icon".into())
+    } else {
+        Ok(icon)
+    }
+}
+
+struct ScreenDc(HDC);
+
+impl Drop for ScreenDc {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe {
+                ReleaseDC(ptr::null_mut(), self.0);
+            }
+        }
+    }
+}
+
+struct MemoryDc(HDC);
+
+impl Drop for MemoryDc {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe {
+                DeleteDC(self.0);
+            }
+        }
+    }
+}
+
+struct GdiObject(HGDIOBJ);
+
+impl Drop for GdiObject {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe {
+                DeleteObject(self.0);
+            }
+        }
+    }
+}
+
+struct SelectedObject {
+    dc: HDC,
+    previous: HGDIOBJ,
+}
+
+impl Drop for SelectedObject {
+    fn drop(&mut self) {
+        unsafe {
+            SelectObject(self.dc, self.previous);
         }
     }
 }

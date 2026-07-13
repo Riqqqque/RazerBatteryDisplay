@@ -1,4 +1,11 @@
-use std::{error::Error, ffi::c_void, fmt, mem, ptr, thread, time::Duration};
+use std::{
+    error::Error,
+    ffi::c_void,
+    fmt,
+    mem::{self, offset_of, size_of},
+    ptr, thread,
+    time::Duration,
+};
 
 use windows_sys::{
     Win32::{
@@ -11,7 +18,10 @@ use windows_sys::{
             },
             HumanInterfaceDevice::{HidD_GetFeature, HidD_GetHidGuid, HidD_SetFeature},
         },
-        Foundation::{CloseHandle, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE},
+        Foundation::{
+            CloseHandle, ERROR_INSUFFICIENT_BUFFER, ERROR_NO_MORE_ITEMS, GENERIC_READ,
+            GENERIC_WRITE, GetLastError, HANDLE, INVALID_HANDLE_VALUE,
+        },
         Storage::FileSystem::{CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING},
     },
     core::GUID,
@@ -192,14 +202,20 @@ fn hid_candidates() -> Result<Vec<HidCandidate>, BatteryError> {
             SetupDiEnumDeviceInterfaces(devices, ptr::null(), &hid_guid, index, &mut interface_data)
         };
         if ok == 0 {
-            break;
+            let error = unsafe { GetLastError() };
+            if error == ERROR_NO_MORE_ITEMS {
+                break;
+            }
+            return Err(BatteryError::new(format!(
+                "SetupDiEnumDeviceInterfaces failed at index {index}: {}",
+                std::io::Error::from_raw_os_error(error as i32)
+            )));
         }
 
-        if let Some(path) = device_path(devices, &interface_data) {
-            let lower_path = path.to_ascii_lowercase();
-            if let Some(candidate) = candidate_from_path(path, &lower_path) {
-                candidates.push(candidate);
-            }
+        let path = device_path(devices, &interface_data)?;
+        let lower_path = path.to_ascii_lowercase();
+        if let Some(candidate) = candidate_from_path(path, &lower_path) {
+            candidates.push(candidate);
         }
 
         index += 1;
@@ -217,9 +233,12 @@ fn hid_candidates() -> Result<Vec<HidCandidate>, BatteryError> {
     Ok(candidates)
 }
 
-fn device_path(devices: HDEVINFO, interface_data: &SP_DEVICE_INTERFACE_DATA) -> Option<String> {
+fn device_path(
+    devices: HDEVINFO,
+    interface_data: &SP_DEVICE_INTERFACE_DATA,
+) -> Result<String, BatteryError> {
     let mut required_size = 0_u32;
-    unsafe {
+    let size_ok = unsafe {
         SetupDiGetDeviceInterfaceDetailW(
             devices,
             interface_data,
@@ -227,15 +246,28 @@ fn device_path(devices: HDEVINFO, interface_data: &SP_DEVICE_INTERFACE_DATA) -> 
             0,
             &mut required_size,
             ptr::null_mut(),
-        );
+        )
+    };
+
+    let size_error = unsafe { GetLastError() };
+    if size_ok != 0 || size_error != ERROR_INSUFFICIENT_BUFFER || required_size == 0 {
+        return Err(BatteryError::new(format!(
+            "could not determine HID interface path size: {}",
+            std::io::Error::from_raw_os_error(size_error as i32)
+        )));
     }
 
-    if required_size == 0 {
-        return None;
+    let byte_len = required_size as usize;
+    if byte_len < size_of::<SP_DEVICE_INTERFACE_DETAIL_DATA_W>() {
+        return Err(BatteryError::new(format!(
+            "HID interface path buffer was too small: {byte_len} bytes"
+        )));
     }
-
-    let mut buffer = vec![0_u8; required_size as usize];
-    let detail = buffer.as_mut_ptr() as *mut SP_DEVICE_INTERFACE_DETAIL_DATA_W;
+    let word_len = byte_len.div_ceil(size_of::<usize>());
+    let mut buffer = vec![0_usize; word_len];
+    let detail = buffer
+        .as_mut_ptr()
+        .cast::<SP_DEVICE_INTERFACE_DETAIL_DATA_W>();
     unsafe {
         (*detail).cbSize = mem::size_of::<SP_DEVICE_INTERFACE_DETAIL_DATA_W>() as u32;
     }
@@ -251,19 +283,27 @@ fn device_path(devices: HDEVINFO, interface_data: &SP_DEVICE_INTERFACE_DATA) -> 
         )
     };
     if ok == 0 {
-        return None;
+        return Err(BatteryError::new(format!(
+            "SetupDiGetDeviceInterfaceDetailW failed: {}",
+            std::io::Error::last_os_error()
+        )));
     }
 
-    let path_ptr = unsafe { (*detail).DevicePath.as_ptr() };
-    let path_len = unsafe {
-        let mut len = 0;
-        while *path_ptr.add(len) != 0 {
-            len += 1;
-        }
-        len
-    };
+    let path_offset = offset_of!(SP_DEVICE_INTERFACE_DETAIL_DATA_W, DevicePath);
+    if byte_len < path_offset + size_of::<u16>() {
+        return Err(BatteryError::new("HID interface path was missing"));
+    }
 
-    String::from_utf16(unsafe { std::slice::from_raw_parts(path_ptr, path_len) }).ok()
+    let path_ptr = unsafe { (detail.cast::<u8>().add(path_offset)).cast::<u16>() };
+    let path_capacity = (byte_len - path_offset) / size_of::<u16>();
+    let path_words = unsafe { std::slice::from_raw_parts(path_ptr, path_capacity) };
+    let path_len = path_words
+        .iter()
+        .position(|word| *word == 0)
+        .ok_or_else(|| BatteryError::new("HID interface path was not null-terminated"))?;
+
+    String::from_utf16(&path_words[..path_len])
+        .map_err(|_| BatteryError::new("HID interface path contained invalid UTF-16"))
 }
 
 fn candidate_from_path(path: String, lower_path: &str) -> Option<HidCandidate> {
@@ -387,18 +427,18 @@ fn validate_response(response: &[u8; HID_REPORT_LEN]) -> Result<u8, String> {
 }
 
 fn is_supported_battery_path(path: &str) -> bool {
-    path.contains("vid_1532")
-        && (path.contains("pid_00e5") || path.contains("pid_00e6"))
-        && !path.contains("&col")
+    has_path_component(path, "vid_1532")
+        && (has_path_component(path, "pid_00e5") || has_path_component(path, "pid_00e6"))
+        && !path_components(path).any(|component| component.starts_with("col"))
         && SAFE_FEATURE_INTERFACE_HINTS
             .iter()
-            .any(|hint| path.contains(hint))
+            .any(|hint| has_path_component(path, hint))
 }
 
 fn pid_from_path(path: &str) -> Option<u16> {
-    if path.contains("pid_00e6") {
+    if has_path_component(path, "pid_00e6") {
         Some(VIPER_V4_PRO_WIRELESS_PID)
-    } else if path.contains("pid_00e5") {
+    } else if has_path_component(path, "pid_00e5") {
         Some(VIPER_V4_PRO_WIRED_PID)
     } else {
         None
@@ -408,19 +448,27 @@ fn pid_from_path(path: &str) -> Option<u16> {
 fn interface_preference(path: &str) -> usize {
     SAFE_FEATURE_INTERFACE_HINTS
         .iter()
-        .position(|hint| path.contains(hint))
+        .position(|hint| has_path_component(path, hint))
         .unwrap_or(SAFE_FEATURE_INTERFACE_HINTS.len())
 }
 
 fn path_interface_hint(path: &str) -> String {
     let lower = path.to_ascii_lowercase();
     for prefix in ["mi_00", "mi_01", "mi_02", "mi_03", "mi_04"] {
-        if lower.contains(prefix) {
+        if has_path_component(&lower, prefix) {
             return prefix.to_string();
         }
     }
 
     "unknown".to_string()
+}
+
+fn path_components(path: &str) -> impl Iterator<Item = &str> {
+    path.split(['#', '&'])
+}
+
+fn has_path_component(path: &str, expected: &str) -> bool {
+    path_components(path).any(|component| component == expected)
 }
 
 fn raw_to_percent(raw: u8) -> u8 {
@@ -546,6 +594,15 @@ mod tests {
         ));
         assert!(!is_supported_battery_path(
             r"\\?\hid#vid_1532&pid_0099&mi_03#b&1d7ae382&0&0000#{...}"
+        ));
+        assert!(!is_supported_battery_path(
+            r"\\?\hid#vid_15320&pid_00e6&mi_03#b&1d7ae382&0&0000#{...}"
+        ));
+        assert!(!is_supported_battery_path(
+            r"\\?\hid#vid_1532&pid_00e60&mi_03#b&1d7ae382&0&0000#{...}"
+        ));
+        assert!(!is_supported_battery_path(
+            r"\\?\hid#vid_1532&pid_00e6&mi_030#b&1d7ae382&0&0000#{...}"
         ));
     }
 

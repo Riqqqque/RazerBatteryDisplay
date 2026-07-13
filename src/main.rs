@@ -19,12 +19,18 @@ fn main() {
         eprintln!("{err}");
 
         #[cfg(windows)]
-        win::message_box(APP_NAME, &err.to_string());
+        win::message_box_error(APP_NAME, &err.to_string());
+
+        std::process::exit(1);
     }
 }
 
 fn run() -> Result<(), Box<dyn Error>> {
     let args: Vec<String> = env::args().skip(1).collect();
+
+    if args.len() > 1 && args.first().is_none_or(|arg| arg != "--finish-uninstall") {
+        return Err("too many command-line arguments".into());
+    }
 
     match args.first().map(String::as_str) {
         Some("--probe") => {
@@ -43,8 +49,16 @@ fn run() -> Result<(), Box<dyn Error>> {
             install::install_quiet()?;
             return Ok(());
         }
+        Some("--repair-startup") => {
+            install::repair_startup()?;
+            return Ok(());
+        }
         Some("--uninstall") => {
             install::uninstall()?;
+            return Ok(());
+        }
+        Some("--uninstall-quiet") => {
+            install::uninstall_quiet()?;
             return Ok(());
         }
         Some("--finish-uninstall") => {
@@ -55,7 +69,8 @@ fn run() -> Result<(), Box<dyn Error>> {
             tray::run()?;
             return Ok(());
         }
-        _ => {}
+        Some(option) => return Err(format!("unknown option: {option}").into()),
+        None => {}
     }
 
     if running_as_setup()? {
