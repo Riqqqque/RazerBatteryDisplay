@@ -42,6 +42,7 @@ const TRAY_UID: u32 = 1;
 const TRAY_CALLBACK: u32 = WM_APP + 1;
 const TIMER_ID: usize = 1;
 const POLL_MS: u32 = 300_000;
+const STARTUP_RETRY_MS: [u32; 4] = [10_000, 20_000, 30_000, 60_000];
 const MANUAL_REFRESH_COOLDOWN: Duration = Duration::from_secs(2);
 const INSTANCE_MUTEX: &str = "Local\\RazerBatteryDisplayTray";
 const TASKBAR_CREATED: &str = "TaskbarCreated";
@@ -100,10 +101,13 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     }
 
     state.hwnd = hwnd;
-    state.refresh();
+    let initial_read_succeeded = state.refresh();
     state.add_or_update_icon(true)?;
 
-    if unsafe { SetTimer(hwnd, TIMER_ID, POLL_MS, None) } == 0 {
+    if state
+        .schedule_after_refresh(initial_read_succeeded)
+        .is_err()
+    {
         state.remove_icon();
         unsafe {
             DestroyWindow(hwnd);
@@ -180,6 +184,7 @@ struct AppState {
     startup_enabled: bool,
     taskbar_created_message: u32,
     last_refresh: Option<Instant>,
+    startup_retries: StartupRetrySchedule,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -202,28 +207,31 @@ impl AppState {
             startup_enabled: install::startup_enabled(),
             taskbar_created_message,
             last_refresh: None,
+            startup_retries: StartupRetrySchedule::new(),
         }
     }
 
-    fn refresh(&mut self) {
+    fn refresh(&mut self) -> bool {
         self.last_refresh = Some(Instant::now());
-        match self.reader.read() {
+        let succeeded = match self.reader.read() {
             Ok(reading) => {
                 self.reading = Some(reading);
                 self.error = None;
+                true
             }
             Err(err) => {
                 self.reading = None;
                 self.error = Some(err.to_string());
+                false
             }
-        }
+        };
 
         let next_key = self.current_display_key();
         if !self.icon.is_null() && !self.icon_registered {
             if self.add_or_update_icon(true).is_ok() {
                 self.display_key = next_key;
             }
-            return;
+            return succeeded;
         }
 
         if next_key != self.display_key
@@ -231,6 +239,22 @@ impl AppState {
         {
             self.display_key = next_key;
         }
+
+        succeeded
+    }
+
+    fn schedule_after_refresh(&mut self, succeeded: bool) -> Result<(), Box<dyn Error>> {
+        let interval = self.startup_retries.next_interval(succeeded);
+        if unsafe { SetTimer(self.hwnd, TIMER_ID, interval, None) } == 0 {
+            Err("could not start the battery refresh timer".into())
+        } else {
+            Ok(())
+        }
+    }
+
+    fn refresh_from_timer(&mut self) {
+        let succeeded = self.refresh();
+        let _ = self.schedule_after_refresh(succeeded);
     }
 
     fn refresh_manual(&mut self) {
@@ -240,7 +264,10 @@ impl AppState {
         {
             return;
         }
-        self.refresh();
+        let succeeded = self.refresh();
+        if succeeded || !self.startup_retries.is_active() {
+            let _ = self.schedule_after_refresh(succeeded);
+        }
     }
 
     fn restore_icon(&mut self) {
@@ -456,7 +483,7 @@ unsafe extern "system" fn window_proc(
             if wparam == TIMER_ID
                 && let Some(state) = state
             {
-                state.refresh();
+                state.refresh_from_timer();
             }
             0
         }
@@ -479,6 +506,35 @@ unsafe extern "system" fn window_proc(
             0
         }
         _ => unsafe { DefWindowProcW(hwnd, message, wparam, lparam) },
+    }
+}
+
+struct StartupRetrySchedule {
+    next_retry: usize,
+}
+
+impl StartupRetrySchedule {
+    fn new() -> Self {
+        Self { next_retry: 0 }
+    }
+
+    fn is_active(&self) -> bool {
+        self.next_retry <= STARTUP_RETRY_MS.len()
+    }
+
+    fn next_interval(&mut self, succeeded: bool) -> u32 {
+        if succeeded {
+            self.next_retry = STARTUP_RETRY_MS.len() + 1;
+            return POLL_MS;
+        }
+
+        if let Some(interval) = STARTUP_RETRY_MS.get(self.next_retry).copied() {
+            self.next_retry += 1;
+            interval
+        } else {
+            self.next_retry = STARTUP_RETRY_MS.len() + 1;
+            POLL_MS
+        }
     }
 }
 
@@ -686,4 +742,33 @@ fn icon_color(percent: Option<u8>) -> u32 {
 
 fn rgb(r: u8, g: u8, b: u8) -> u32 {
     r as u32 | ((g as u32) << 8) | ((b as u32) << 16)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn startup_failures_use_bounded_backoff_then_normal_polling() {
+        let mut schedule = StartupRetrySchedule::new();
+
+        assert_eq!(schedule.next_interval(false), 10_000);
+        assert_eq!(schedule.next_interval(false), 20_000);
+        assert_eq!(schedule.next_interval(false), 30_000);
+        assert_eq!(schedule.next_interval(false), 60_000);
+        assert_eq!(schedule.next_interval(false), POLL_MS);
+        assert_eq!(schedule.next_interval(false), POLL_MS);
+        assert!(!schedule.is_active());
+    }
+
+    #[test]
+    fn startup_success_immediately_restores_normal_polling() {
+        let mut schedule = StartupRetrySchedule::new();
+
+        assert_eq!(schedule.next_interval(false), 10_000);
+        assert!(schedule.is_active());
+        assert_eq!(schedule.next_interval(true), POLL_MS);
+        assert!(!schedule.is_active());
+        assert_eq!(schedule.next_interval(false), POLL_MS);
+    }
 }

@@ -15,6 +15,7 @@ Razer Battery Display keeps it simple: start with Windows, sit in the tray, show
 - Shows the Viper V4 Pro battery percentage in the Windows tray.
 - Shows the same percentage on hover.
 - Refreshes automatically every 5 minutes.
+- Retries briefly at Windows startup if the mouse is not ready yet.
 - Lets you refresh manually from the tray icon.
 - Installs per-user with a normal `.exe`.
 - Adds a normal Apps & Features uninstall entry.
@@ -33,7 +34,7 @@ Razer Battery Display keeps it simple: start with Windows, sit in the tray, show
 - No RGB/profile system.
 - No always-busy polling loop.
 
-The app only queries the Viper V4 Pro non-pointer HID feature interfaces (`mi_03`/`mi_04`) for battery reports, then caches the working path. It does not hook mouse input, read pointer movement, or send feature reports to the mouse/keyboard input collections. After startup it only wakes up for the Windows tray message loop and a battery poll every 5 minutes. During normal operation, the tray icon is only redrawn when the visible percentage changes; it is also restored if Explorer recreates the taskbar.
+The app only queries the Viper V4 Pro non-pointer HID feature interfaces (`mi_03`/`mi_04`) for battery reports, then caches the working path. It does not hook mouse input, read pointer movement, or send feature reports to the mouse/keyboard input collections. If Windows starts the app before the mouse is ready, failed startup reads use a short bounded backoff of 10, 20, 30, and 60 seconds. The first successful read immediately restores the normal 5-minute interval. During normal operation, the tray icon is only redrawn when the visible percentage changes; it is also restored if Explorer recreates the taskbar.
 
 ## Example Footprint
 
