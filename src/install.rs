@@ -510,9 +510,10 @@ fn decode_reg_string(bytes: &[u8]) -> Option<String> {
         return None;
     }
 
-    let words: Vec<u16> = bytes
-        .chunks_exact(size_of::<u16>())
-        .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+    let (chunks, _) = bytes.as_chunks::<{ size_of::<u16>() }>();
+    let words: Vec<u16> = chunks
+        .iter()
+        .map(|chunk| u16::from_le_bytes(*chunk))
         .collect();
     let end = words
         .iter()
