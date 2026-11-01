@@ -7,31 +7,35 @@ use std::{
 use windows_sys::Win32::{
     Foundation::{
         CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE, HWND, LPARAM, LRESULT, POINT,
-        RECT, WPARAM,
+        WPARAM,
     },
-    Graphics::Gdi::{
-        CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, CreateBitmap, CreateCompatibleBitmap,
-        CreateCompatibleDC, CreateFontW, CreateSolidBrush, DEFAULT_CHARSET, DEFAULT_PITCH,
-        DT_CENTER, DT_SINGLELINE, DT_VCENTER, DeleteDC, DeleteObject, DrawTextW, FF_DONTCARE,
-        FW_BOLD, FillRect, GetDC, HBRUSH, HDC, HGDIOBJ, OUT_DEFAULT_PRECIS, ReleaseDC,
-        SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
+    System::{
+        LibraryLoader::GetModuleHandleW,
+        Threading::{
+            CreateMutexW, GetCurrentProcess, PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+            PROCESS_POWER_THROTTLING_EXECUTION_SPEED, PROCESS_POWER_THROTTLING_STATE,
+            ProcessPowerThrottling, SetProcessInformation, SetProcessWorkingSetSize,
+        },
     },
-    System::{LibraryLoader::GetModuleHandleW, Threading::CreateMutexW},
     UI::{
+        Input::{
+            Ime::ImmDisableIME, RAWINPUTDEVICE, RIDEV_INPUTSINK, RIDEV_REMOVE,
+            RegisterRawInputDevices,
+        },
         Shell::{
             NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW,
             Shell_NotifyIconW,
         },
         WindowsAndMessaging::{
-            AppendMenuW, CREATESTRUCTW, CW_USEDEFAULT, CreateIconIndirect, CreatePopupMenu,
+            AppendMenuW, CREATESTRUCTW, CW_USEDEFAULT, CreateIcon, CreatePopupMenu,
             CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyMenu, DestroyWindow,
             DispatchMessageW, GWLP_USERDATA, GetCursorPos, GetMessageW, GetWindowLongPtrW, HICON,
-            HMENU, ICONINFO, IDC_ARROW, IDI_APPLICATION, IMAGE_ICON, KillTimer, LR_DEFAULTSIZE,
-            LoadCursorW, LoadImageW, MF_CHECKED, MF_SEPARATOR, MF_STRING, MSG, PostMessageW,
-            PostQuitMessage, RegisterClassW, RegisterWindowMessageW, SetForegroundWindow, SetTimer,
+            HMENU, IDC_ARROW, IDI_APPLICATION, IMAGE_ICON, KillTimer, LR_DEFAULTSIZE, LoadCursorW,
+            LoadImageW, MF_CHECKED, MF_SEPARATOR, MF_STRING, MSG, PostMessageW, PostQuitMessage,
+            RegisterClassW, RegisterWindowMessageW, SetCoalescableTimer, SetForegroundWindow,
             SetWindowLongPtrW, TPM_BOTTOMALIGN, TPM_LEFTALIGN, TrackPopupMenu, TranslateMessage,
-            WM_APP, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_DESTROY, WM_LBUTTONDBLCLK, WM_LBUTTONUP,
-            WM_NULL, WM_RBUTTONUP, WM_TIMER, WNDCLASSW, WS_OVERLAPPED,
+            WM_APP, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_DESTROY, WM_INPUT, WM_LBUTTONDBLCLK,
+            WM_LBUTTONUP, WM_NULL, WM_RBUTTONUP, WM_TIMER, WNDCLASSW, WS_OVERLAPPED,
         },
     },
 };
@@ -43,6 +47,30 @@ const TRAY_CALLBACK: u32 = WM_APP + 1;
 const TIMER_ID: usize = 1;
 const POLL_MS: u32 = 300_000;
 const STARTUP_RETRY_MS: [u32; 4] = [10_000, 20_000, 30_000, 60_000];
+const TIMER_TOLERANCE_DIVISOR: u32 = 20;
+const MOTION_SETTLE_MS: u32 = 750;
+const MOTION_RETRY_MS: u32 = 15_000;
+const ICON_SIZE: usize = 32;
+const ICON_TEXT: u32 = rgb(255, 255, 255);
+const GLYPH_WIDTH: usize = 5;
+const GLYPH_HEIGHT: usize = 7;
+const GLYPH_QUESTION: usize = 10;
+#[rustfmt::skip]
+const GLYPHS: [[u8; GLYPH_HEIGHT]; 11] = [
+    [0b01110, 0b10001, 0b10011, 0b10101, 0b11001, 0b10001, 0b01110],
+    [0b00100, 0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110],
+    [0b01110, 0b10001, 0b00001, 0b00010, 0b00100, 0b01000, 0b11111],
+    [0b11111, 0b00010, 0b00100, 0b00010, 0b00001, 0b10001, 0b01110],
+    [0b00010, 0b00110, 0b01010, 0b10010, 0b11111, 0b00010, 0b00010],
+    [0b11111, 0b10000, 0b11110, 0b00001, 0b00001, 0b10001, 0b01110],
+    [0b00110, 0b01000, 0b10000, 0b11110, 0b10001, 0b10001, 0b01110],
+    [0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b01000, 0b01000],
+    [0b01110, 0b10001, 0b10001, 0b01110, 0b10001, 0b10001, 0b01110],
+    [0b01110, 0b10001, 0b10001, 0b01111, 0b00001, 0b00010, 0b01100],
+    [0b01110, 0b10001, 0b00001, 0b00010, 0b00100, 0b00000, 0b00100],
+];
+const HID_USAGE_PAGE_GENERIC: u16 = 0x01;
+const HID_USAGE_GENERIC_MOUSE: u16 = 0x02;
 const MANUAL_REFRESH_COOLDOWN: Duration = Duration::from_secs(2);
 const INSTANCE_MUTEX: &str = "Local\\RazerBatteryDisplayTray";
 const TASKBAR_CREATED: &str = "TaskbarCreated";
@@ -56,6 +84,12 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     let Some(_instance_guard) = SingleInstance::acquire()? else {
         return Ok(());
     };
+
+    request_efficiency_mode();
+    // A tray icon takes no text input, so skip loading the input method libraries.
+    unsafe {
+        ImmDisableIME(0);
+    }
 
     let class_name = win::wide_null(WINDOW_CLASS);
     let instance = unsafe { GetModuleHandleW(ptr::null()) };
@@ -102,7 +136,6 @@ pub fn run() -> Result<(), Box<dyn Error>> {
 
     state.hwnd = hwnd;
     let initial_read_succeeded = state.refresh();
-    state.add_or_update_icon(true)?;
 
     if state
         .schedule_after_refresh(initial_read_succeeded)
@@ -185,6 +218,9 @@ struct AppState {
     taskbar_created_message: u32,
     last_refresh: Option<Instant>,
     startup_retries: StartupRetrySchedule,
+    motion_listening: bool,
+    motion_read_pending: bool,
+    working_set_trimmed: bool,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -204,10 +240,13 @@ impl AppState {
             reading: None,
             error: None,
             display_key: DisplayKey::Unknown,
-            startup_enabled: install::startup_enabled(),
+            startup_enabled: false,
             taskbar_created_message,
             last_refresh: None,
             startup_retries: StartupRetrySchedule::new(),
+            motion_listening: false,
+            motion_read_pending: false,
+            working_set_trimmed: false,
         }
     }
 
@@ -227,16 +266,14 @@ impl AppState {
         };
 
         let next_key = self.current_display_key();
-        if !self.icon.is_null() && !self.icon_registered {
+        if !self.icon_registered {
             if self.add_or_update_icon(true).is_ok() {
                 self.display_key = next_key;
             }
             return succeeded;
         }
 
-        if next_key != self.display_key
-            && (self.icon.is_null() || self.add_or_update_icon(false).is_ok())
-        {
+        if next_key != self.display_key && self.add_or_update_icon(false).is_ok() {
             self.display_key = next_key;
         }
 
@@ -244,8 +281,24 @@ impl AppState {
     }
 
     fn schedule_after_refresh(&mut self, succeeded: bool) -> Result<(), Box<dyn Error>> {
+        self.motion_read_pending = false;
+        if succeeded {
+            self.stop_motion_listener();
+            if !self.working_set_trimmed {
+                self.working_set_trimmed = true;
+                trim_working_set();
+            }
+        } else {
+            self.start_motion_listener();
+        }
+
         let interval = self.startup_retries.next_interval(succeeded);
-        if unsafe { SetTimer(self.hwnd, TIMER_ID, interval, None) } == 0 {
+        self.set_refresh_timer(interval)
+    }
+
+    fn set_refresh_timer(&self, interval: u32) -> Result<(), Box<dyn Error>> {
+        let tolerance = interval / TIMER_TOLERANCE_DIVISOR;
+        if unsafe { SetCoalescableTimer(self.hwnd, TIMER_ID, interval, None, tolerance) } == 0 {
             Err("could not start the battery refresh timer".into())
         } else {
             Ok(())
@@ -253,8 +306,40 @@ impl AppState {
     }
 
     fn refresh_from_timer(&mut self) {
+        let motion_read = mem::take(&mut self.motion_read_pending);
         let succeeded = self.refresh();
-        let _ = self.schedule_after_refresh(succeeded);
+        let _ = if motion_read && !succeeded {
+            // The movement came from something else, or the mouse needs longer.
+            // Stay disarmed for a while so another mouse cannot trigger constant reads.
+            self.set_refresh_timer(MOTION_RETRY_MS)
+        } else {
+            self.schedule_after_refresh(succeeded)
+        };
+    }
+
+    // Raw input stays registered only until the first event, so the app never
+    // receives a stream of mouse messages. The event contents are not read.
+    fn start_motion_listener(&mut self) {
+        if !self.motion_listening {
+            self.motion_listening = register_mouse_input(RIDEV_INPUTSINK, self.hwnd);
+        }
+    }
+
+    fn stop_motion_listener(&mut self) {
+        if self.motion_listening {
+            register_mouse_input(RIDEV_REMOVE, ptr::null_mut());
+            self.motion_listening = false;
+        }
+    }
+
+    fn on_mouse_motion(&mut self) {
+        if !self.motion_listening {
+            return;
+        }
+
+        self.stop_motion_listener();
+        self.motion_read_pending = true;
+        let _ = self.set_refresh_timer(MOTION_SETTLE_MS);
     }
 
     fn refresh_manual(&mut self) {
@@ -487,6 +572,12 @@ unsafe extern "system" fn window_proc(
             }
             0
         }
+        WM_INPUT => {
+            if let Some(state) = state {
+                state.on_mouse_motion();
+            }
+            unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
+        }
         WM_CLOSE => {
             unsafe {
                 DestroyWindow(hwnd);
@@ -495,6 +586,7 @@ unsafe extern "system" fn window_proc(
         }
         WM_DESTROY => {
             if let Some(state) = state {
+                state.stop_motion_listener();
                 state.remove_icon();
             }
             unsafe {
@@ -538,6 +630,40 @@ impl StartupRetrySchedule {
     }
 }
 
+// Asks Windows to run this process on its most efficient scheduling. Best effort only.
+fn request_efficiency_mode() {
+    let state = PROCESS_POWER_THROTTLING_STATE {
+        Version: PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+        ControlMask: PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
+        StateMask: PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
+    };
+    unsafe {
+        SetProcessInformation(
+            GetCurrentProcess(),
+            ProcessPowerThrottling,
+            &state as *const PROCESS_POWER_THROTTLING_STATE as *const _,
+            mem::size_of::<PROCESS_POWER_THROTTLING_STATE>() as u32,
+        );
+    }
+}
+
+// Startup-only pages are never used again, so hand them back once after the first reading.
+fn trim_working_set() {
+    unsafe {
+        SetProcessWorkingSetSize(GetCurrentProcess(), usize::MAX, usize::MAX);
+    }
+}
+
+fn register_mouse_input(flags: u32, target: HWND) -> bool {
+    let device = RAWINPUTDEVICE {
+        usUsagePage: HID_USAGE_PAGE_GENERIC,
+        usUsage: HID_USAGE_GENERIC_MOUSE,
+        dwFlags: flags,
+        hwndTarget: target,
+    };
+    unsafe { RegisterRawInputDevices(&device, 1, mem::size_of::<RAWINPUTDEVICE>() as u32) != 0 }
+}
+
 fn append_menu(menu: HMENU, id: usize, label: &str) {
     let label = win::wide_null(label);
     unsafe {
@@ -558,110 +684,76 @@ fn append_menu_checked(menu: HMENU, id: usize, label: &str, checked: bool) {
 }
 
 fn make_icon(reading: Option<&battery::BatteryReading>) -> Result<HICON, Box<dyn Error>> {
-    let label = reading
-        .map(|reading| reading.percent.to_string())
-        .unwrap_or_else(|| "?".to_string());
     let percent = reading.map(|reading| reading.percent);
-    let bg = icon_color(percent);
-    let label = win::wide_null(&label);
-    let font_name = win::wide_null("Segoe UI");
+    let pixels = render_icon(percent);
+    let mask = [0_u8; ICON_SIZE * ICON_SIZE / 8];
+    let icon = unsafe {
+        CreateIcon(
+            ptr::null_mut(),
+            ICON_SIZE as i32,
+            ICON_SIZE as i32,
+            1,
+            32,
+            mask.as_ptr(),
+            pixels.as_ptr().cast(),
+        )
+    };
 
-    unsafe {
-        let screen_dc = ScreenDc(GetDC(ptr::null_mut()));
-        if screen_dc.0.is_null() {
-            return load_fallback_icon();
+    if icon.is_null() {
+        load_fallback_icon()
+    } else {
+        Ok(icon)
+    }
+}
+
+fn render_icon(percent: Option<u8>) -> [u32; ICON_SIZE * ICON_SIZE] {
+    let mut pixels = [icon_color(percent); ICON_SIZE * ICON_SIZE];
+    let mut glyphs = [GLYPH_QUESTION; 3];
+    let count = match percent {
+        Some(value @ 100..) => {
+            glyphs = [
+                (value / 100) as usize,
+                (value / 10 % 10) as usize,
+                (value % 10) as usize,
+            ];
+            3
         }
-
-        let dc = MemoryDc(CreateCompatibleDC(screen_dc.0));
-        if dc.0.is_null() {
-            return load_fallback_icon();
+        Some(value @ 10..) => {
+            glyphs[0] = (value / 10) as usize;
+            glyphs[1] = (value % 10) as usize;
+            2
         }
-
-        let bitmap = GdiObject(CreateCompatibleBitmap(screen_dc.0, 32, 32) as HGDIOBJ);
-        if bitmap.0.is_null() {
-            return load_fallback_icon();
+        Some(value) => {
+            glyphs[0] = value as usize;
+            1
         }
-        let old_bitmap = SelectObject(dc.0, bitmap.0);
-        if old_bitmap.is_null() {
-            return load_fallback_icon();
-        }
-        let _bitmap_selection = SelectedObject {
-            dc: dc.0,
-            previous: old_bitmap,
-        };
+        None => 1,
+    };
 
-        let brush = GdiObject(CreateSolidBrush(bg) as HGDIOBJ);
-        if brush.0.is_null() {
-            return load_fallback_icon();
-        }
-        let rect = RECT {
-            left: 0,
-            top: 0,
-            right: 32,
-            bottom: 32,
-        };
-        if FillRect(dc.0, &rect, brush.0 as HBRUSH) == 0 {
-            return load_fallback_icon();
-        }
+    let scale = if count == 3 { 2 } else { 3 };
+    let gap = scale - 1;
+    let width = count * GLYPH_WIDTH * scale + (count - 1) * gap;
+    let left = (ICON_SIZE - width) / 2;
+    let top = (ICON_SIZE - GLYPH_HEIGHT * scale) / 2;
 
-        let font = GdiObject(CreateFontW(
-            -16,
-            0,
-            0,
-            0,
-            FW_BOLD as i32,
-            0,
-            0,
-            0,
-            DEFAULT_CHARSET as u32,
-            OUT_DEFAULT_PRECIS as u32,
-            CLIP_DEFAULT_PRECIS as u32,
-            CLEARTYPE_QUALITY as u32,
-            (DEFAULT_PITCH | FF_DONTCARE) as u32,
-            font_name.as_ptr(),
-        ) as HGDIOBJ);
-        let _font_selection = if font.0.is_null() {
-            None
-        } else {
-            let previous = SelectObject(dc.0, font.0);
-            (!previous.is_null()).then_some(SelectedObject { dc: dc.0, previous })
-        };
-
-        SetBkMode(dc.0, TRANSPARENT as i32);
-        SetTextColor(dc.0, rgb(255, 255, 255));
-        let mut text_rect = RECT {
-            left: 0,
-            top: 0,
-            right: 32,
-            bottom: 31,
-        };
-        DrawTextW(
-            dc.0,
-            label.as_ptr(),
-            -1,
-            &mut text_rect,
-            DT_CENTER | DT_VCENTER | DT_SINGLELINE,
-        );
-
-        let mask = GdiObject(CreateBitmap(32, 32, 1, 1, ptr::null()) as HGDIOBJ);
-        if mask.0.is_null() {
-            return load_fallback_icon();
-        }
-        let info = ICONINFO {
-            fIcon: 1,
-            xHotspot: 0,
-            yHotspot: 0,
-            hbmMask: mask.0,
-            hbmColor: bitmap.0,
-        };
-
-        let icon = CreateIconIndirect(&info);
-        if icon.is_null() {
-            load_fallback_icon()
-        } else {
-            Ok(icon)
+    for (index, glyph) in glyphs[..count].iter().enumerate() {
+        let origin = left + index * (GLYPH_WIDTH * scale + gap);
+        for (row, bits) in GLYPHS[*glyph].iter().enumerate() {
+            for column in 0..GLYPH_WIDTH {
+                if bits & (1 << (GLYPH_WIDTH - 1 - column)) == 0 {
+                    continue;
+                }
+                for y in 0..scale {
+                    for x in 0..scale {
+                        pixels[(top + row * scale + y) * ICON_SIZE + origin + column * scale + x] =
+                            ICON_TEXT;
+                    }
+                }
+            }
         }
     }
+
+    pixels
 }
 
 fn load_fallback_icon() -> Result<HICON, Box<dyn Error>> {
@@ -682,55 +774,6 @@ fn load_fallback_icon() -> Result<HICON, Box<dyn Error>> {
     }
 }
 
-struct ScreenDc(HDC);
-
-impl Drop for ScreenDc {
-    fn drop(&mut self) {
-        if !self.0.is_null() {
-            unsafe {
-                ReleaseDC(ptr::null_mut(), self.0);
-            }
-        }
-    }
-}
-
-struct MemoryDc(HDC);
-
-impl Drop for MemoryDc {
-    fn drop(&mut self) {
-        if !self.0.is_null() {
-            unsafe {
-                DeleteDC(self.0);
-            }
-        }
-    }
-}
-
-struct GdiObject(HGDIOBJ);
-
-impl Drop for GdiObject {
-    fn drop(&mut self) {
-        if !self.0.is_null() {
-            unsafe {
-                DeleteObject(self.0);
-            }
-        }
-    }
-}
-
-struct SelectedObject {
-    dc: HDC,
-    previous: HGDIOBJ,
-}
-
-impl Drop for SelectedObject {
-    fn drop(&mut self) {
-        unsafe {
-            SelectObject(self.dc, self.previous);
-        }
-    }
-}
-
 fn icon_color(percent: Option<u8>) -> u32 {
     match percent {
         None => rgb(64, 68, 72),
@@ -740,13 +783,30 @@ fn icon_color(percent: Option<u8>) -> u32 {
     }
 }
 
-fn rgb(r: u8, g: u8, b: u8) -> u32 {
-    r as u32 | ((g as u32) << 8) | ((b as u32) << 16)
+const fn rgb(r: u8, g: u8, b: u8) -> u32 {
+    0xFF00_0000 | ((r as u32) << 16) | ((g as u32) << 8) | b as u32
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn icon_text_stays_inside_the_canvas_for_every_percentage() {
+        assert!(render_icon(None).contains(&ICON_TEXT));
+        for percent in 0..=100 {
+            assert!(render_icon(Some(percent)).contains(&ICON_TEXT));
+        }
+    }
+
+    #[test]
+    fn three_digit_icon_uses_the_full_width_without_overlap() {
+        let pixels = render_icon(Some(100));
+        let columns_with_text = (0..ICON_SIZE)
+            .filter(|x| (0..ICON_SIZE).any(|y| pixels[y * ICON_SIZE + x] == ICON_TEXT))
+            .count();
+        assert!(columns_with_text > 20);
+    }
 
     #[test]
     fn startup_failures_use_bounded_backoff_then_normal_polling() {

@@ -2,6 +2,7 @@ use std::{
     env,
     error::Error,
     fs,
+    os::windows::process::CommandExt,
     path::{Component, Path, PathBuf},
     process::Command,
     time::{Duration, Instant},
@@ -16,7 +17,7 @@ use windows_sys::Win32::{
             RegCloseKey, RegCreateKeyExW, RegDeleteTreeW, RegDeleteValueW, RegOpenKeyExW,
             RegQueryValueExW, RegSetValueExW,
         },
-        Threading::{GetCurrentProcessId, OpenProcess, WaitForSingleObject},
+        Threading::{CREATE_NO_WINDOW, GetCurrentProcessId, OpenProcess, WaitForSingleObject},
     },
     UI::WindowsAndMessaging::{FindWindowW, GetWindowThreadProcessId, PostMessageW, WM_CLOSE},
 };
@@ -296,6 +297,7 @@ fn create_lnk_with_powershell(exe: &Path, lnk: &Path) -> Result<(), Box<dyn Erro
         .arg("Hidden")
         .arg("-Command")
         .arg(script)
+        .creation_flags(CREATE_NO_WINDOW)
         .status()?;
 
     if status.success() {

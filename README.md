@@ -1,82 +1,102 @@
-# Razer Battery Display
+<p align="center">
+  <img src="assets/icon.png" width="128" height="128" alt="Razer Battery Display icon">
+</p>
 
-[![Windows build](https://github.com/Riqqqque/RazerBatteryDisplay/actions/workflows/windows.yml/badge.svg)](https://github.com/Riqqqque/RazerBatteryDisplay/actions/workflows/windows.yml)
+<h1 align="center">Razer Battery Display</h1>
 
-A tiny Windows 11 tray app that shows the battery percentage for a Razer Viper V4 Pro.
+<p align="center">
+  <strong>Your mouse battery percentage in the tray. No Synapse. No bloat.</strong>
+</p>
 
-## Why
+<p align="center">
+  <a href="https://github.com/Riqqqque/RazerBatteryDisplay/actions/workflows/windows.yml"><img src="https://github.com/Riqqqque/RazerBatteryDisplay/actions/workflows/windows.yml/badge.svg" alt="Windows build"></a>
+</p>
 
-Razer Synapse does a lot, but that is exactly the problem if all you want is one number: mouse battery percentage. This app exists because the useful part was the battery readout, not a full background suite with profiles, lighting, services, account prompts, and extra resource use.
+A tiny Windows 11 tray app that does one job: it shows the battery percentage of a Razer Viper V4 Pro.
 
-Razer Battery Display keeps it simple: start with Windows, sit in the tray, show the percentage, and stay out of the way.
+**296 KB exe. 1.4 MB of private memory. 1 thread. Effectively zero CPU.**
 
-## What It Does
+## Why This Exists
 
-- Shows the Viper V4 Pro battery percentage in the Windows tray.
-- Shows the same percentage on hover.
-- Refreshes automatically every 5 minutes.
-- Retries briefly at Windows startup if the mouse is not ready yet.
-- Lets you refresh manually from the tray icon.
-- Installs per-user with a normal `.exe`.
-- Adds a normal Apps & Features uninstall entry.
-- Starts with Windows unless you turn that off in the tray menu.
+Razer Synapse wants to run services, background processes, an account login, lighting, profiles, and update prompts, all so you can see one number. If all you want is to know when to charge your mouse, that is a lot of software sitting on a gaming PC doing nothing for you.
 
-## Why It Is Lightweight
+So this app keeps the one useful part and throws away the rest. It reads the battery straight from the mouse, shows it in the tray, and gets out of the way. You don't need Synapse installed at all.
 
-- Built in Rust.
-- Native Win32 tray app.
-- Direct Windows HID calls for the mouse battery report.
-- No Razer Synapse dependency.
-- No webview.
-- No background service.
-- No telemetry.
-- No account login.
-- No RGB/profile system.
-- No always-busy polling loop.
+## What You Get
 
-The app only queries the Viper V4 Pro non-pointer HID feature interfaces (`mi_03`/`mi_04`) for battery reports, then caches the working path. It does not hook mouse input, read pointer movement, or send feature reports to the mouse/keyboard input collections. If Windows starts the app before the mouse is ready, failed startup reads use a short bounded backoff of 10, 20, 30, and 60 seconds. The first successful read immediately restores the normal 5-minute interval. During normal operation, the tray icon is only redrawn when the visible percentage changes; it is also restored if Explorer recreates the taskbar.
+- The battery percentage right in the tray, as a live number you can read at a glance.
+- Green, amber, and red colours, so a low battery stands out.
+- The same percentage on hover.
+- An automatic refresh every 5 minutes.
+- A reading as soon as you touch the mouse. If it was asleep at boot, the first movement picks it up.
+- Left-click to refresh on demand.
+- Starts with Windows, and you can turn that off from the tray menu.
+- A normal per-user install with a normal Apps & Features uninstall entry.
 
-## Example Footprint
+## What You Don't Get
 
-Measured on Windows 11 with the optimized build installed. Windows can trim or grow the shared working set over time, so private memory is the best quick read on what the app itself owns.
+| Razer Synapse | Razer Battery Display |
+| --- | --- |
+| Background services | None |
+| Account login | None |
+| Telemetry and online features | None. It never touches the network |
+| Lighting and profile engine | None |
+| Update prompts | None |
+| Large install | One 296 KB exe |
+
+## How Light Is It?
+
+Measured on Windows 11 with the release build installed:
 
 | Metric | Result |
 | --- | ---: |
-| Installed exe size | about 257 KB |
-| Private memory | about 1.9 MB |
-| Working set | about 12 MB |
-| Idle CPU over 75 seconds | 0% |
+| Exe size | 296 KB |
+| Private memory | about 1.4 MB |
+| Working set after the first reading | about 0.4 MB |
+| CPU time in the first minute | about 0.02 s |
 | Settled threads | 1 |
-| Handles | about 150 |
+| Handles | about 133 |
+| Services installed | 0 |
+| Network connections | 0 |
 
-Most of the working set is normal shared Windows DLL/runtime memory.
+The working set grows back a little with use, and most of it is shared Windows DLL memory.
+
+That number is the result of deliberate choices, not just using Rust:
+
+- **Native Win32.** No webview, no runtime, no framework, and one dependency: Microsoft's Windows API bindings.
+- **Asleep until needed.** The app waits on the Windows message loop and uses no CPU between refreshes. There is no busy loop.
+- **Direct driver requests.** Battery reads go straight to the HID driver, so `hid.dll` and `setupapi.dll` are never loaded.
+- **Built-in pixel font.** Tray digits are drawn from a tiny font inside the exe, so no font or text-shaping libraries load. The icon is only redrawn when the percentage changes.
+- **Efficiency mode.** The app asks Windows to schedule it as a low-power process and lets its timer share wake-ups with other work.
+- **Startup memory handed back.** After the first reading, memory used only during startup is returned to Windows.
+
+## Safe While Gaming
+
+The app never hooks your mouse and never reads pointer data. It only talks to the Viper V4 Pro's non-pointer HID feature interfaces (`mi_03` and `mi_04`), then caches the working path. It never sends feature reports to the mouse or keyboard input collections.
+
+If Windows starts the app before the mouse is ready, it retries after 10, 20, 30, and 60 seconds. While it has no battery value, it also registers for a single Windows Raw Input notification. The first movement removes that registration straight away, so the app never receives a stream of mouse events, even at 8000 Hz. It reads the battery 750 ms later, which gives a sleeping mouse time to reconnect, and the contents of the event are ignored.
+
+If that read fails, the listener stays off for 15 seconds, so using a different mouse can't cause constant reads. The first good read removes the listener and returns to the normal 5-minute refresh.
 
 ## Supported Mouse
-
-Currently targeted at:
 
 - Razer Viper V4 Pro wired: `1532:00E5`
 - Razer Viper V4 Pro wireless: `1532:00E6`
 
-The battery query follows the same command path used by current OpenRazer Viper V4 Pro support work. On this machine, Windows did not expose the mouse battery through the normal device battery property, so the app reads the Razer HID battery report directly.
+The battery query follows the same command path as current OpenRazer Viper V4 Pro support work. Windows does not expose this mouse's battery through the normal device battery property, so the app reads the Razer HID battery report directly.
 
 ## Install
 
-Build the setup exe:
+Download `RazerBatteryDisplaySetup.exe` from [Releases](https://github.com/Riqqqque/RazerBatteryDisplay/releases/latest) and run it. It installs for the current user, starts the tray app, and enables startup with Windows.
+
+To build the setup exe yourself:
 
 ```powershell
 cargo build --release
 New-Item -ItemType Directory -Force dist
 Copy-Item target\release\razer-battery-display.exe dist\RazerBatteryDisplaySetup.exe -Force
-```
-
-Run:
-
-```powershell
 dist\RazerBatteryDisplaySetup.exe
 ```
-
-It installs to the current user, starts the tray app, and enables startup with Windows.
 
 For a quiet reinstall from a fresh build:
 
@@ -86,14 +106,12 @@ target\release\razer-battery-display.exe --install-quiet
 
 ## Tray Menu
 
-Right-click the tray icon for:
+Left-click refreshes the percentage. Right-click for:
 
 - Refresh
 - Start with Windows
 - Uninstall
 - Quit
-
-Left-click refreshes the battery percentage.
 
 ## Build Checks
 
@@ -118,7 +136,7 @@ cargo run -- --probe-verbose
 
 ## Privacy
 
-The app only talks to the local HID device and the current-user Windows registry entries needed for install/startup/uninstall. Startup uses the normal per-user `Run` entry; it does not install a service or scheduled task. It does not send network requests, collect telemetry, or store personal data.
+The app only talks to the local HID device and the current-user Windows registry entries needed for install, startup, and uninstall. Startup uses the normal per-user `Run` entry, not a service or scheduled task. It sends no network requests, collects no telemetry, and stores no personal data.
 
 ## License
 
