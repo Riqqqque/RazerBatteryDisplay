@@ -1,7 +1,7 @@
 use std::{ffi::OsStr, os::windows::ffi::OsStrExt, ptr};
 
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    MB_ICONERROR, MB_ICONINFORMATION, MB_OK, MessageBoxW,
+    IDYES, MB_ICONERROR, MB_ICONINFORMATION, MB_ICONQUESTION, MB_OK, MB_YESNO, MessageBoxW,
 };
 
 pub fn wide_null(value: &str) -> Vec<u16> {
@@ -9,23 +9,20 @@ pub fn wide_null(value: &str) -> Vec<u16> {
 }
 
 pub fn message_box(title: &str, body: &str) {
-    message_box_with_style(title, body, MB_ICONINFORMATION);
+    message_box_with_style(title, body, MB_OK | MB_ICONINFORMATION);
 }
 
 pub fn message_box_error(title: &str, body: &str) {
-    message_box_with_style(title, body, MB_ICONERROR);
+    message_box_with_style(title, body, MB_OK | MB_ICONERROR);
 }
 
-fn message_box_with_style(title: &str, body: &str, style: u32) {
+pub fn confirm(title: &str, body: &str) -> bool {
+    message_box_with_style(title, body, MB_YESNO | MB_ICONQUESTION) == IDYES
+}
+
+fn message_box_with_style(title: &str, body: &str, style: u32) -> i32 {
     let title = wide_null(title);
     let body = wide_null(body);
 
-    unsafe {
-        MessageBoxW(
-            ptr::null_mut(),
-            body.as_ptr(),
-            title.as_ptr(),
-            MB_OK | style,
-        );
-    }
+    unsafe { MessageBoxW(ptr::null_mut(), body.as_ptr(), title.as_ptr(), style) }
 }

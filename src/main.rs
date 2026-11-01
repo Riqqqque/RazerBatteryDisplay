@@ -3,6 +3,7 @@
 mod battery;
 mod install;
 mod tray;
+mod update;
 mod win;
 
 use std::{env, error::Error, path::Path};
@@ -63,6 +64,10 @@ fn run() -> Result<(), Box<dyn Error>> {
         }
         Some("--finish-uninstall") => {
             install::finish_uninstall(&args[1..])?;
+            return Ok(());
+        }
+        Some("--update") => {
+            update::run();
             return Ok(());
         }
         Some("--run") => {

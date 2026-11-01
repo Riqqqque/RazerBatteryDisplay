@@ -14,7 +14,7 @@
 
 A tiny Windows 11 tray app that does one job: it shows the battery percentage of a Razer Viper V4 Pro.
 
-**296 KB exe. 1.4 MB of private memory. 1 thread. Effectively zero CPU.**
+**311 KB exe. 1.4 MB of private memory. 1 thread. Effectively zero CPU.**
 
 ## Why This Exists
 
@@ -30,6 +30,7 @@ So this app keeps the one useful part and throws away the rest. It reads the bat
 - An automatic refresh every 5 minutes.
 - A reading as soon as you touch the mouse. If it was asleep at boot, the first movement picks it up.
 - Left-click to refresh on demand.
+- One-click updates from the tray menu.
 - Starts with Windows, and you can turn that off from the tray menu.
 - A normal per-user install with a normal Apps & Features uninstall entry.
 
@@ -39,10 +40,10 @@ So this app keeps the one useful part and throws away the rest. It reads the bat
 | --- | --- |
 | Background services | None |
 | Account login | None |
-| Telemetry and online features | None. It never touches the network |
+| Telemetry and online features | None. It only goes online when you click Check for Updates |
 | Lighting and profile engine | None |
-| Update prompts | None |
-| Large install | One 296 KB exe |
+| Update prompts | None. You check when you want to |
+| Large install | One 311 KB exe |
 
 ## How Light Is It?
 
@@ -50,14 +51,14 @@ Measured on Windows 11 with the release build installed:
 
 | Metric | Result |
 | --- | ---: |
-| Exe size | 296 KB |
+| Exe size | 311 KB |
 | Private memory | about 1.4 MB |
 | Working set after the first reading | about 0.4 MB |
 | CPU time in the first minute | about 0.02 s |
 | Settled threads | 1 |
 | Handles | about 133 |
 | Services installed | 0 |
-| Network connections | 0 |
+| Background network connections | 0 |
 
 The working set grows back a little with use, and most of it is shared Windows DLL memory.
 
@@ -77,6 +78,12 @@ The app never hooks your mouse and never reads pointer data. It only talks to th
 If Windows starts the app before the mouse is ready, it retries after 10, 20, 30, and 60 seconds. While it has no battery value, it also registers for a single Windows Raw Input notification. The first movement removes that registration straight away, so the app never receives a stream of mouse events, even at 8000 Hz. It reads the battery 750 ms later, which gives a sleeping mouse time to reconnect, and the contents of the event are ignored.
 
 If that read fails, the listener stays off for 15 seconds, so using a different mouse can't cause constant reads. The first good read removes the listener and returns to the normal 5-minute refresh.
+
+## Updating
+
+Right-click the tray icon and choose **Check for Updates**. If a newer version is out, say yes and the app downloads it, verifies its SHA-256 checksum, installs it, and restarts itself.
+
+Nothing checks in the background. The update check runs in a short-lived separate process using the `curl` built into Windows, so the tray app itself carries no network code and stays offline.
 
 ## Supported Mouse
 
@@ -110,6 +117,7 @@ Left-click refreshes the percentage. Right-click for:
 
 - Refresh
 - Start with Windows
+- Check for Updates
 - Uninstall
 - Quit
 
@@ -136,7 +144,7 @@ cargo run -- --probe-verbose
 
 ## Privacy
 
-The app only talks to the local HID device and the current-user Windows registry entries needed for install, startup, and uninstall. Startup uses the normal per-user `Run` entry, not a service or scheduled task. It sends no network requests, collects no telemetry, and stores no personal data.
+The app only talks to the local HID device and the current-user Windows registry entries needed for install, startup, and uninstall. Startup uses the normal per-user `Run` entry, not a service or scheduled task. The only network request is the one you start with Check for Updates, which talks to this project's GitHub releases. It collects no telemetry and stores no personal data.
 
 ## License
 

@@ -22,7 +22,7 @@ use windows_sys::Win32::{
     UI::WindowsAndMessaging::{FindWindowW, GetWindowThreadProcessId, PostMessageW, WM_CLOSE},
 };
 
-use crate::{APP_ID, APP_NAME, APP_VERSION, EXE_NAME, WINDOW_CLASS, win};
+use crate::{APP_ID, APP_NAME, APP_VERSION, EXE_NAME, WINDOW_CLASS, update, win};
 
 const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 const STARTUP_APPROVED_RUN_KEY: &str =
@@ -66,7 +66,7 @@ fn install_inner(show_message: bool) -> Result<(), Box<dyn Error>> {
         &normalized_absolute_path(&source)?,
         &normalized_absolute_path(&target)?,
     ) {
-        fs::copy(&source, &target)?;
+        copy_when_unlocked(&source, &target)?;
     }
 
     set_startup_enabled(true)?;
@@ -84,6 +84,20 @@ fn install_inner(show_message: bool) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+// The updater runs from the installed exe, which stays locked until that process exits.
+fn copy_when_unlocked(source: &Path, target: &Path) -> Result<(), Box<dyn Error>> {
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        match fs::copy(source, target) {
+            Ok(_) => return Ok(()),
+            Err(_) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(250));
+            }
+            Err(err) => return Err(err.into()),
+        }
+    }
+}
+
 pub fn uninstall() -> Result<(), Box<dyn Error>> {
     uninstall_inner(true)
 }
@@ -97,6 +111,7 @@ fn uninstall_inner(show_message: bool) -> Result<(), Box<dyn Error>> {
     remove_startup_registration()?;
     delete_reg_tree(HKEY_CURRENT_USER, UNINSTALL_KEY)?;
     remove_start_menu_shortcut();
+    let _ = fs::remove_file(update::downloaded_setup());
 
     let dir = install_dir();
     let current = env::current_exe()?;

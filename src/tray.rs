@@ -40,7 +40,7 @@ use windows_sys::Win32::{
     },
 };
 
-use crate::{APP_NAME, WINDOW_CLASS, battery, install, win};
+use crate::{APP_NAME, APP_VERSION, WINDOW_CLASS, battery, install, win};
 
 const TRAY_UID: u32 = 1;
 const TRAY_CALLBACK: u32 = WM_APP + 1;
@@ -79,6 +79,7 @@ const MENU_REFRESH: usize = 1001;
 const MENU_STARTUP: usize = 1002;
 const MENU_UNINSTALL: usize = 1003;
 const MENU_QUIT: usize = 1004;
+const MENU_UPDATE: usize = 1005;
 
 pub fn run() -> Result<(), Box<dyn Error>> {
     let Some(_instance_guard) = SingleInstance::acquire()? else {
@@ -448,6 +449,11 @@ impl AppState {
             "Start with Windows",
             self.startup_enabled,
         );
+        append_menu(
+            menu,
+            MENU_UPDATE,
+            &format!("Check for Updates (v{APP_VERSION})"),
+        );
         unsafe {
             AppendMenuW(menu, MF_SEPARATOR, 0, ptr::null());
         }
@@ -480,6 +486,14 @@ impl AppState {
                 APP_NAME,
                 &format!("Could not change the startup setting.\n\n{err}"),
             ),
+        }
+    }
+
+    fn check_for_updates(&self) {
+        let result = std::env::current_exe()
+            .and_then(|exe| std::process::Command::new(exe).arg("--update").spawn());
+        if let Err(err) = result {
+            win::message_box_error(APP_NAME, &format!("Could not start the updater.\n\n{err}"));
         }
     }
 
@@ -555,6 +569,7 @@ unsafe extern "system" fn window_proc(
                 match wparam & 0xffff {
                     MENU_REFRESH => state.refresh_manual(),
                     MENU_STARTUP => state.toggle_startup(),
+                    MENU_UPDATE => state.check_for_updates(),
                     MENU_UNINSTALL => state.uninstall(),
                     MENU_QUIT => unsafe {
                         DestroyWindow(hwnd);
